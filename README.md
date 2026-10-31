@@ -77,12 +77,6 @@ archivo existente, sin error de lectura, tamaño menor a la capacidad del buffer
 - Librería **Irvine32** configurada (plantilla de proyecto del curso)
 - Plataforma de compilación: **x86** (32 bits)
 
-##  Compilar y ejecutar
-
-1. Abre la solución con la plantilla de Irvine32 en **x86 / Debug**.
-2. Deja `Papeleria.asm` como único archivo fuente (excluye cualquier otro `main`).
-3. Copia `inventario.dat` a la carpeta de trabajo (por defecto, la carpeta del proyecto; verifica *Propiedades → Depuración → Directorio de trabajo = `$(ProjectDir)`*).
-4. Ejecuta con **Ctrl+F5**. Al iniciar debe aparecer `Catalogo cargado correctamente`.
 
 ##  Estructura del código
 
