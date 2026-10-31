@@ -39,7 +39,7 @@ Si se venden **10 o más unidades** de un producto, se descuenta el **10 %** del
 - Todos los importes se muestran con dos decimales y la etiqueta `MXN`.
 - Se comprueban desbordamientos (`MUL`/`ADD` con bandera de acarreo) y una operación rechazada no modifica los datos anteriores.
 
-## 🧠 Organización en memoria
+##  Organización en memoria
 
 Cada producto ocupa un registro de **44 bytes**; `ESI` recorre la tabla sumando 44 por producto.
 
