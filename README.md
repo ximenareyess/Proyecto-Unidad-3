@@ -6,8 +6,6 @@ Administra el inventario y las ventas de una papelería, con guardado y carga de
 
 > Toda la captura y la salida de números se resuelve con **conversiones propias** (`ReadString` / `WriteString`). No se usan `ReadDec`, `ReadInt`, `ParseDecimal32`, `WriteDec` ni `WriteHex`.
 
-> Toda la captura y la salida de números se resuelve con **conversiones propias** (`ReadString` / `WriteString`). No se usan `ReadDec`, `ReadInt`, `ParseDecimal32`, `WriteDec` ni `WriteHex`.
-
 ##  Funciones
 
 | # | Opción | Descripción |
