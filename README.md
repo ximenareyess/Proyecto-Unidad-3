@@ -66,10 +66,6 @@ BOR-542;Borrador ;10.45;24
 
 Formato de línea: `CODIGO;Nombre;precio MXN;existencia`.
 
-**Validaciones al cargar** (se interpreta a una tabla temporal y solo si todo es válido reemplaza el catálogo):
-archivo existente, sin error de lectura, tamaño menor a la capacidad del buffer, firma `INV1`, máximo 10 productos, código/nombre/precio/existencia válidos (con las mismas rutinas de la captura) y sin códigos duplicados. Si el archivo falta o está dañado, se muestra un aviso y se conserva el catálogo actual.
-
-
 ##  Estructura del código
 
 | Procedimiento | Función |
