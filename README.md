@@ -113,8 +113,4 @@ Cada procedimiento documenta su entrada, salida y registros modificados, y conse
 - E0N Productions. *Taller ASM* (pila y CALL). https://ns2.elhacker.net/descargas/manuales/Lenguajes%20de%20Programacion/Ensamblador/Taller%20ASM%20-%20E0N%20Productions.pdf
 - Referencia de la instrucción DIV (basada en el manual de Intel). https://www.felixcloutier.com/x86/div.html
 - Jorgensen, E. *x86-64 Assembly Language Programming with Ubuntu*, cap. 10 (conversión de entero a cadena). https://eng.libretexts.org/Bookshelves/Computer_Science/Programming_Languages/x86-64_Assembly_Language_Programming_with_Ubuntu_(Jorgensen)/10%3A_Program_Development/10.03%3A_Implement_the_Program
-¿
 
-## Licencia
-
-Proyecto con fines educativos.
