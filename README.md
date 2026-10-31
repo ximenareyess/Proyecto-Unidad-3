@@ -2,10 +2,6 @@
 
 **Negocio:** papelería. **Regla adicional:** descuento por cantidad (10 % del importe base si se venden ≥ 10 unidades; fracción de centavo descartada con división entera).
 
-
-# Sistema de Ventas e Inventario – Papelería (MASM x86)
-las ventas de una papelería, con guardado y carga del catálogo en un archivo de texto.
-
 > Toda la captura y la salida de números se resuelve con **conversiones propias** (`ReadString` / `WriteString`). No se usan `ReadDec`, `ReadInt`, `ParseDecimal32`, `WriteDec` ni `WriteHex`.
 
 ##  Funciones
