@@ -1,0 +1,6 @@
+C:\LenguajesInterfaz\ProyectoBase32\Project32_VS2022\Debug\Project.exe
+C:\LenguajesInterfaz\Practica2\Project32_VS2022\Debug\Project.exe
+C:\LenguajesInterfaz\holamundo\Project32_VS2022\Debug\Project.exe
+C:\LenguajesInterfaz\proyecto\Project32_VS2022\Debug\Project.exe
+C:\Users\santi\Downloads\Proyecto Unidad 2\Proyecto Unidad 2\Proyecto Unidad 2\Project32_VS2022\Debug\Project.exe
+C:\Users\santi\Downloads\Proyecto Unidad 2Y3\Proyecto Unidad 2Y3\Proyecto Unidad 2Y3\Project32_VS2022\Debug\Project.exe

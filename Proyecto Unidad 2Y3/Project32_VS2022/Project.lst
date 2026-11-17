@@ -1,0 +1,2764 @@
+Microsoft (R) Macro Assembler Version 14.44.35229.0	    11/16/26 21:59:13
+AddTwo.asm						     Page 1 - 1
+
+
+				; ============================================================================
+				; Proyecto Unidad 3 - Ventas e inventario en ensamblador (MASM x86, Irvine32)
+				; Negocio : Papeleria
+				; Regla   : DESCUENTO POR CANTIDAD -> si se venden 10 o mas unidades de un
+				;           producto, se descuenta el 10% del importe base. La fraccion de
+				;           centavo se descarta (division entera).
+				; Archivo : inventario.dat (binario). Ver README.md para el formato.
+				; Convenciones: todos los procedimientos preservan los registros que NO
+				;           aparecen en "Modifica". Los resultados con error usan CF=1.
+				;
+				; UNIDAD 3: mismas funciones, menu y validaciones que la Unidad 2. Cambios:
+				;   - Macros: Fail, Reject, Ask, AskCheck, JNotRange, JNotDigit, Put, ShowU32,
+				;             ShowMXN, CopyField, RecAddr, FileBytes, ParseBetween, MenuItem (LOCAL).
+				;   - PROC ... USES en lugar de push/pop manuales.
+				;   - Procedimientos nuevos: ParseRange, CalcDiscount, CalcSale, ConfirmDiscard,
+				;             DoLoad, ToDecStr, SplitMXN, ZeroMem, ReadInventoryFile,
+				;             ValidateTable, HasDuplicates.
+				;   - Constante MAGIC_INV1 para comparar la firma "INV1" de una sola vez.
+				; ============================================================================
+				INCLUDE Irvine32.inc
+			      C ; Include file for Irvine32.lib             (Irvine32.inc)
+			      C 
+			      C ;OPTION CASEMAP:NONE		; optional: make identifiers case-sensitive
+			      C 
+			      C INCLUDE SmallWin.inc		; MS-Windows prototypes, structures, and constants
+			      C .NOLIST
+			      C .LIST
+			      C 
+			      C INCLUDE VirtualKeys.inc
+			      C ; VirtualKeys.inc
+			      C .NOLIST
+			      C .LIST
+			      C 
+			      C 
+			      C .NOLIST
+			      C .LIST
+			      C 
+
+				; ---------------------------- Constantes ------------------------------------
+ = 0000000A			PROD_MAX     EQU 10
+ = 0000002C			REC_SIZE     EQU 44            ; tamano de cada registro de producto
+ = 00000000			OFF_CODE     EQU 0             ; 8 bytes  : "ABC-123",0
+ = 00000008			OFF_NAME     EQU 8             ; 26 bytes : nombre (1..25) + 0
+ = 00000024			OFF_PRICE    EQU 36            ; DWORD    : centavos (1..999999)
+ = 00000028			OFF_STOCK    EQU 40            ; DWORD    : existencia (0..100)
+ = 00000008			CODE_SIZE    EQU 8
+ = 0000001A			NAME_SIZE    EQU 26
+ = 00000008			HDR_SIZE     EQU 8             ; firma INV1 (4) + conteo (4)
+ = 000001C0			FILE_MAX     EQU HDR_SIZE + PROD_MAX*REC_SIZE   ; 448 bytes: tamano maximo valido
+ = 000001C1			FILE_CAP     EQU FILE_MAX + 1            ; se lee 1 byte de mas para detectar exceso
+ = 0000003F			INBUF_MAX    EQU 63
+ = 000F423F			MAX_PRICE    EQU 999999
+ = 00000064			MAX_STOCK    EQU 100
+ = 0000000A			DISC_MIN_QTY EQU 10
+ = 0000000A			DISC_PCT     EQU 10
+ = 31564E49			MAGIC_INV1   EQU 31564E49h     ; "INV1" leido como DWORD (little-endian)
+
+				; ============================================================================
+				; Macros
+				; ============================================================================
+
+				; Say : muestra una cadena constante (preserva EDX)
+				Say MACRO txt
+				    push edx
+				    mov  edx, OFFSET txt
+				    call WriteString
+				    pop  edx
+				ENDM
+
+				; Fail : muestra un error y sale del procedimiento con CF=1.
+				Fail MACRO txt
+				    Say  txt
+				    stc
+				    ret
+				ENDM
+
+				; Reject : muestra un mensaje de rechazo y sale del procedimiento (sin tocar CF).
+				Reject MACRO txt
+				    Say  txt
+				    ret
+				ENDM
+
+				; Ask : muestra el prompt, captura con GetInput y deja ESI = OFFSET inbuf.
+				;       CF (error de GetInput) se conserva porque MOV no modifica banderas.
+				Ask MACRO prompt
+				    Say  prompt
+				    call GetInput
+				    mov  esi, OFFSET inbuf
+				ENDM
+
+				; JNotRange : salta a lbl si rg esta fuera de [vmin..vmax] (sin signo).
+				JNotRange MACRO rg, vmin, vmax, lbl
+				    cmp  rg, vmin
+				    jb   lbl
+				    cmp  rg, vmax
+				    ja   lbl
+				ENDM
+
+				; JNotDigit : salta a lbl si rg no es un caracter '0'..'9'.
+				JNotDigit MACRO rg, lbl
+				    JNotRange rg, '0', '9', lbl
+				ENDM
+
+				; Put : imprime un registro/variable como decimal sin signo. Modifica: EAX
+				Put MACRO src
+				    mov  eax, src
+				    call PrintU32
+				ENDM
+
+				; ShowU32 / ShowMXN : "etiqueta" + valor + salto de linea. Modifican: EAX, EFLAGS
+				ShowU32 MACRO txt, src
+				    Say  txt
+				    Put  src
+				    call Crlf
+				ENDM
+
+				ShowMXN MACRO txt, src
+				    Say  txt
+				    mov  eax, src
+				    call PrintMXN
+				    call Crlf
+				ENDM
+
+				; CopyField : copia la cadena src al campo dst (cualquier operando de memoria)
+				;             rellenando con 0. Modifica: ESI, EDI, ECX, EFLAGS
+				CopyField MACRO src, dst, sz
+				    mov  esi, OFFSET src
+				    lea  edi, dst
+				    mov  ecx, sz
+				    call CopyPad
+				ENDM
+
+				; RecAddr : dst = OFFSET tbl + idx * REC_SIZE. dst = registro de 32 bits.
+				RecAddr MACRO dst, tbl, idx
+				    mov  dst, idx
+				    imul dst, dst, REC_SIZE
+				    add  dst, OFFSET tbl
+				ENDM
+
+				; ParseBetween : ESI = cadena; EAX = valor en [vmin..vmax]; CF=1 si invalido.
+				;                Prepara EDX/ECX para ParseRange. Modifica: EAX, ECX, EDX, EFLAGS
+				ParseBetween MACRO vmin, vmax
+				    mov  edx, vmin
+				    mov  ecx, vmax
+				    call ParseRange
+				ENDM
+
+				; FileBytes : dst = HDR_SIZE + cnt * REC_SIZE (bytes que ocupa el archivo con
+				;             cnt registros). Se usa al guardar y al validar el tamano al cargar.
+				;             dst = registro de 32 bits, cnt = registro o variable. Modifica: dst, EFLAGS
+				FileBytes MACRO dst, cnt
+				    imul dst, cnt, REC_SIZE
+				    add  dst, HDR_SIZE
+				ENDM
+
+				; AskCheck : pregunta, captura y valida con el procedimiento check.
+				;            Salta a quit si la captura fallo (mensaje ya mostrado por GetInput)
+				;            y a bad si check devuelve CF=1. ESI = OFFSET inbuf al entrar a check.
+				AskCheck MACRO prompt, check, bad, quit
+				    Ask  prompt
+				    jc   quit
+				    call check
+				    jc   bad
+				ENDM
+
+				; MenuItem : si AL = key llama a target y regresa al menu. LOCAL evita
+				;            etiquetas duplicadas al usarla varias veces.
+				MenuItem MACRO key, target
+				    LOCAL skip
+				    cmp  al, key
+				    jne  skip
+				    call target
+				    jmp  menu_loop
+				skip:
+				ENDM
+
+ 00000000			.data
+				; --- Bloque contiguo que se escribe tal cual en el archivo -------------------
+ 00000000 49 4E 56 31		fileHdr     BYTE  "INV1"                      ; 4 bytes de firma
+ 00000004 00000000		prodCount   DWORD 0                           ; numero de productos
+ 00000008  000001B8 [		products    BYTE  PROD_MAX*REC_SIZE DUP(0)    ; tabla de registros
+	    00
+	   ]
+ 000001C0 00000000		revenue     DWORD 0              ; ingresos de la sesion (centavos)
+ 000001C4 00			dirty       BYTE  0              ; 1 = cambios sin guardar
+ 000001C5 00000000		mainEsp     DWORD ?              ; ESP de referencia para verificar la pila
+
+ 000001C9  00000040 [		inbuf       BYTE  INBUF_MAX+1 DUP(0)
+	    00
+	   ]
+ 00000209  00000040 [		junkbuf     BYTE  INBUF_MAX+1 DUP(0)
+	    00
+	   ]
+ 00000249  00000008 [		tmpCode     BYTE  CODE_SIZE DUP(0)
+	    00
+	   ]
+ 00000251  0000001A [		tmpName     BYTE  NAME_SIZE DUP(0)
+	    00
+	   ]
+ 0000026B 00000000		tmpPrice    DWORD ?
+ 0000026F 00000000		tmpStock    DWORD ?
+ 00000273  0000000C [		numbuf      BYTE  12 DUP(0)
+	    00
+	   ]
+
+ 0000027F 69 6E 76 65 6E	fileName    BYTE  "inventario.dat",0
+	   74 61 72 69 6F
+	   2E 64 61 74 00
+ 0000028E 00000000		hFile       DWORD ?
+ 00000292 00000000		expected    DWORD ?
+ 00000296 00000000		bytesRead   DWORD ?
+ 0000029A  000001C2 [		loadbuf     BYTE  FILE_CAP+1 DUP(0)
+	    00
+	   ]
+
+ 0000045C 0D 0A 3D 3D 3D	msgBanner   BYTE  13,10,"=== PAPELERIA - Ventas e inventario ===",13,10,0
+	   20 50 41 50 45
+	   4C 45 52 49 41
+	   20 2D 20 56 65
+	   6E 74 61 73 20
+	   65 20 69 6E 76
+	   65 6E 74 61 72
+	   69 6F 20 3D 3D
+	   3D 0D 0A 00
+ 00000488 0D 0A 31 29 20	msgMenu     BYTE  13,10,"1) Registrar producto   2) Mostrar inventario  3) Buscar por codigo",13,10
+	   52 65 67 69 73
+	   74 72 61 72 20
+	   70 72 6F 64 75
+	   63 74 6F 20 20
+	   20 32 29 20 4D
+	   6F 73 74 72 61
+	   72 20 69 6E 76
+	   65 6E 74 61 72
+	   69 6F 20 20 33
+	   29 20 42 75 73
+	   63 61 72 20 70
+	   6F 72 20 63 6F
+	   64 69 67 6F 0D
+	   0A
+ 000004CF  34 29 20 52 65	            BYTE  "4) Recibir mercancia    5) Vender              6) Resumen",13,10
+	   63 69 62 69 72
+	   20 6D 65 72 63
+	   61 6E 63 69 61
+	   20 20 20 20 35
+	   29 20 56 65 6E
+	   64 65 72 20 20
+	   20 20 20 20 20
+	   20 20 20 20 20
+	   20 20 36 29 20
+	   52 65 73 75 6D
+	   65 6E 0D 0A
+ 0000050A  37 29 20 47 75	            BYTE  "7) Guardar              8) Cargar              9) Salir",13,10
+	   61 72 64 61 72
+	   20 20 20 20 20
+	   20 20 20 20 20
+	   20 20 20 20 38
+	   29 20 43 61 72
+	   67 61 72 20 20
+	   20 20 20 20 20
+	   20 20 20 20 20
+	   20 20 39 29 20
+	   53 61 6C 69 72
+	   0D 0A
+ 00000543  4F 70 63 69 6F	            BYTE  "Opcion: ",0
+	   6E 3A 20 00
+ 0000054C 4F 70 63 69 6F	msgBadOpt   BYTE  "Opcion invalida.",13,10,0
+	   6E 20 69 6E 76
+	   61 6C 69 64 61
+	   2E 0D 0A 00
+ 0000055F 45 6E 74 72 61	msgBadInput BYTE  "Entrada vacia o demasiado larga. Operacion rechazada.",13,10,0
+	   64 61 20 76 61
+	   63 69 61 20 6F
+	   20 64 65 6D 61
+	   73 69 61 64 6F
+	   20 6C 61 72 67
+	   61 2E 20 4F 70
+	   65 72 61 63 69
+	   6F 6E 20 72 65
+	   63 68 61 7A 61
+	   64 61 2E 0D 0A
+	   00
+ 00000597 43 6F 64 69 67	msgAskCode  BYTE  "Codigo (ABC-123): ",0
+	   6F 20 28 41 42
+	   43 2D 31 32 33
+	   29 3A 20 00
+ 000005AA 4E 6F 6D 62 72	msgAskName  BYTE  "Nombre (1 a 25 caracteres): ",0
+	   65 20 28 31 20
+	   61 20 32 35 20
+	   63 61 72 61 63
+	   74 65 72 65 73
+	   29 3A 20 00
+ 000005C7 50 72 65 63 69	msgAskPrice BYTE  "Precio en MXN (ej. 185.50): ",0
+	   6F 20 65 6E 20
+	   4D 58 4E 20 28
+	   65 6A 2E 20 31
+	   38 35 2E 35 30
+	   29 3A 20 00
+ 000005E4 45 78 69 73 74	msgAskStock BYTE  "Existencia inicial (0 a 100): ",0
+	   65 6E 63 69 61
+	   20 69 6E 69 63
+	   69 61 6C 20 28
+	   30 20 61 20 31
+	   30 30 29 3A 20
+	   00
+ 00000603 43 61 6E 74 69	msgAskQty   BYTE  "Cantidad (1 a 100): ",0
+	   64 61 64 20 28
+	   31 20 61 20 31
+	   30 30 29 3A 20
+	   00
+ 00000618 43 6F 64 69 67	msgBadCode  BYTE  "Codigo invalido (formato ABC-123). Operacion rechazada.",13,10,0
+	   6F 20 69 6E 76
+	   61 6C 69 64 6F
+	   20 28 66 6F 72
+	   6D 61 74 6F 20
+	   41 42 43 2D 31
+	   32 33 29 2E 20
+	   4F 70 65 72 61
+	   63 69 6F 6E 20
+	   72 65 63 68 61
+	   7A 61 64 61 2E
+	   0D 0A 00
+ 00000652 43 6F 64 69 67	msgDup      BYTE  "Codigo duplicado. Operacion rechazada.",13,10,0
+	   6F 20 64 75 70
+	   6C 69 63 61 64
+	   6F 2E 20 4F 70
+	   65 72 61 63 69
+	   6F 6E 20 72 65
+	   63 68 61 7A 61
+	   64 61 2E 0D 0A
+	   00
+ 0000067B 50 72 6F 64 75	msgNotFound BYTE  "Producto no encontrado.",13,10,0
+	   63 74 6F 20 6E
+	   6F 20 65 6E 63
+	   6F 6E 74 72 61
+	   64 6F 2E 0D 0A
+	   00
+ 00000695 4E 6F 6D 62 72	msgBadName  BYTE  "Nombre invalido. Operacion rechazada.",13,10,0
+	   65 20 69 6E 76
+	   61 6C 69 64 6F
+	   2E 20 4F 70 65
+	   72 61 63 69 6F
+	   6E 20 72 65 63
+	   68 61 7A 61 64
+	   61 2E 0D 0A 00
+ 000006BD 50 72 65 63 69	msgBadPrice BYTE  "Precio invalido (0.01 a 9999.99, sin simbolos). Operacion rechazada.",13,10,0
+	   6F 20 69 6E 76
+	   61 6C 69 64 6F
+	   20 28 30 2E 30
+	   31 20 61 20 39
+	   39 39 39 2E 39
+	   39 2C 20 73 69
+	   6E 20 73 69 6D
+	   62 6F 6C 6F 73
+	   29 2E 20 4F 70
+	   65 72 61 63 69
+	   6F 6E 20 72 65
+	   63 68 61 7A 61
+	   64 61 2E 0D 0A
+	   00
+ 00000704 45 78 69 73 74	msgBadStock BYTE  "Existencia invalida. Operacion rechazada.",13,10,0
+	   65 6E 63 69 61
+	   20 69 6E 76 61
+	   6C 69 64 61 2E
+	   20 4F 70 65 72
+	   61 63 69 6F 6E
+	   20 72 65 63 68
+	   61 7A 61 64 61
+	   2E 0D 0A 00
+ 00000730 43 61 6E 74 69	msgBadQty   BYTE  "Cantidad invalida. Operacion rechazada.",13,10,0
+	   64 61 64 20 69
+	   6E 76 61 6C 69
+	   64 61 2E 20 4F
+	   70 65 72 61 63
+	   69 6F 6E 20 72
+	   65 63 68 61 7A
+	   61 64 61 2E 0D
+	   0A 00
+ 0000075A 43 61 70 61 63	msgFull     BYTE  "Capacidad llena (10 productos). Operacion rechazada.",13,10,0
+	   69 64 61 64 20
+	   6C 6C 65 6E 61
+	   20 28 31 30 20
+	   70 72 6F 64 75
+	   63 74 6F 73 29
+	   2E 20 4F 70 65
+	   72 61 63 69 6F
+	   6E 20 72 65 63
+	   68 61 7A 61 64
+	   61 2E 0D 0A 00
+ 00000791 50 72 6F 64 75	msgRegOk    BYTE  "Producto registrado.",13,10,0
+	   63 74 6F 20 72
+	   65 67 69 73 74
+	   72 61 64 6F 2E
+	   0D 0A 00
+ 000007A8 49 6E 76 65 6E	msgEmpty    BYTE  "Inventario vacio.",13,10,0
+	   74 61 72 69 6F
+	   20 76 61 63 69
+	   6F 2E 0D 0A 00
+ 000007BC 4C 61 20 65 78	msgExcess   BYTE  "La existencia excederia 100 unidades. Operacion rechazada.",13,10,0
+	   69 73 74 65 6E
+	   63 69 61 20 65
+	   78 63 65 64 65
+	   72 69 61 20 31
+	   30 30 20 75 6E
+	   69 64 61 64 65
+	   73 2E 20 4F 70
+	   65 72 61 63 69
+	   6F 6E 20 72 65
+	   63 68 61 7A 61
+	   64 61 2E 0D 0A
+	   00
+ 000007F9 4D 65 72 63 61	msgRecvOk   BYTE  "Mercancia recibida. Existencia actual: ",0
+	   6E 63 69 61 20
+	   72 65 63 69 62
+	   69 64 61 2E 20
+	   45 78 69 73 74
+	   65 6E 63 69 61
+	   20 61 63 74 75
+	   61 6C 3A 20 00
+ 00000821 45 78 69 73 74	msgNoStock  BYTE  "Existencias insuficientes. Venta rechazada.",13,10,0
+	   65 6E 63 69 61
+	   73 20 69 6E 73
+	   75 66 69 63 69
+	   65 6E 74 65 73
+	   2E 20 56 65 6E
+	   74 61 20 72 65
+	   63 68 61 7A 61
+	   64 61 2E 0D 0A
+	   00
+ 0000084F 44 65 73 62 6F	msgOvf      BYTE  "Desbordamiento detectado. Operacion rechazada.",13,10,0
+	   72 64 61 6D 69
+	   65 6E 74 6F 20
+	   64 65 74 65 63
+	   74 61 64 6F 2E
+	   20 4F 70 65 72
+	   61 63 69 6F 6E
+	   20 72 65 63 68
+	   61 7A 61 64 61
+	   2E 0D 0A 00
+ 00000880 49 6D 70 6F 72	msgBase     BYTE  "Importe base : ",0
+	   74 65 20 62 61
+	   73 65 20 3A 20
+	   00
+ 00000890 44 65 73 63 75	msgDisc     BYTE  "Descuento 10% por cantidad (>=10 uds): -",0
+	   65 6E 74 6F 20
+	   31 30 25 20 70
+	   6F 72 20 63 61
+	   6E 74 69 64 61
+	   64 20 28 3E 3D
+	   31 30 20 75 64
+	   73 29 3A 20 2D
+	   00
+ 000008B9 53 69 6E 20 64	msgNoDisc   BYTE  "Sin descuento (menos de 10 unidades).",13,10,0
+	   65 73 63 75 65
+	   6E 74 6F 20 28
+	   6D 65 6E 6F 73
+	   20 64 65 20 31
+	   30 20 75 6E 69
+	   64 61 64 65 73
+	   29 2E 0D 0A 00
+ 000008E1 49 6D 70 6F 72	msgFinal    BYTE  "Importe final: ",0
+	   74 65 20 66 69
+	   6E 61 6C 3A 20
+	   00
+ 000008F1 56 65 6E 74 61	msgSaleOk   BYTE  "Venta aceptada.",13,10,0
+	   20 61 63 65 70
+	   74 61 64 61 2E
+	   0D 0A 00
+ 00000903 55 6E 69 64 61	msgSumUnits BYTE  "Unidades disponibles : ",0
+	   64 65 73 20 64
+	   69 73 70 6F 6E
+	   69 62 6C 65 73
+	   20 3A 20 00
+ 0000091B 56 61 6C 6F 72	msgSumValue BYTE  "Valor del inventario : ",0
+	   20 64 65 6C 20
+	   69 6E 76 65 6E
+	   74 61 72 69 6F
+	   20 3A 20 00
+ 00000933 49 6E 67 72 65	msgSumRev   BYTE  "Ingresos de sesion   : ",0
+	   73 6F 73 20 64
+	   65 20 73 65 73
+	   69 6F 6E 20 20
+	   20 3A 20 00
+ 0000094B 43 61 74 61 6C	msgSaved    BYTE  "Catalogo guardado en inventario.dat.",13,10,0
+	   6F 67 6F 20 67
+	   75 61 72 64 61
+	   64 6F 20 65 6E
+	   20 69 6E 76 65
+	   6E 74 61 72 69
+	   6F 2E 64 61 74
+	   2E 0D 0A 00
+ 00000972 45 72 72 6F 72	msgSaveErr  BYTE  "Error al guardar el archivo.",13,10,0
+	   20 61 6C 20 67
+	   75 61 72 64 61
+	   72 20 65 6C 20
+	   61 72 63 68 69
+	   76 6F 2E 0D 0A
+	   00
+ 00000991 4E 6F 20 65 78	msgNoFile   BYTE  "No existe inventario.dat (o no se pudo abrir). Catalogo actual conservado.",13,10,0
+	   69 73 74 65 20
+	   69 6E 76 65 6E
+	   74 61 72 69 6F
+	   2E 64 61 74 20
+	   28 6F 20 6E 6F
+	   20 73 65 20 70
+	   75 64 6F 20 61
+	   62 72 69 72 29
+	   2E 20 43 61 74
+	   61 6C 6F 67 6F
+	   20 61 63 74 75
+	   61 6C 20 63 6F
+	   6E 73 65 72 76
+	   61 64 6F 2E 0D
+	   0A 00
+ 000009DE 45 72 72 6F 72	msgReadErr  BYTE  "Error de lectura del archivo. Catalogo actual conservado.",13,10,0
+	   20 64 65 20 6C
+	   65 63 74 75 72
+	   61 20 64 65 6C
+	   20 61 72 63 68
+	   69 76 6F 2E 20
+	   43 61 74 61 6C
+	   6F 67 6F 20 61
+	   63 74 75 61 6C
+	   20 63 6F 6E 73
+	   65 72 76 61 64
+	   6F 2E 0D 0A 00
+ 00000A1A 41 72 63 68 69	msgInvalid  BYTE  "Archivo danado o con formato invalido. Catalogo actual conservado.",13,10,0
+	   76 6F 20 64 61
+	   6E 61 64 6F 20
+	   6F 20 63 6F 6E
+	   20 66 6F 72 6D
+	   61 74 6F 20 69
+	   6E 76 61 6C 69
+	   64 6F 2E 20 43
+	   61 74 61 6C 6F
+	   67 6F 20 61 63
+	   74 75 61 6C 20
+	   63 6F 6E 73 65
+	   72 76 61 64 6F
+	   2E 0D 0A 00
+ 00000A5F 43 61 74 61 6C	msgLoaded   BYTE  "Catalogo cargado correctamente.",13,10,0
+	   6F 67 6F 20 63
+	   61 72 67 61 64
+	   6F 20 63 6F 72
+	   72 65 63 74 61
+	   6D 65 6E 74 65
+	   2E 0D 0A 00
+ 00000A81 48 61 79 20 63	msgUnsaved  BYTE  "Hay cambios sin guardar. Continuar de todos modos? (S/N): ",0
+	   61 6D 62 69 6F
+	   73 20 73 69 6E
+	   20 67 75 61 72
+	   64 61 72 2E 20
+	   43 6F 6E 74 69
+	   6E 75 61 72 20
+	   64 65 20 74 6F
+	   64 6F 73 20 6D
+	   6F 64 6F 73 3F
+	   20 28 53 2F 4E
+	   29 3A 20 00
+ 00000ABC 45 52 52 4F 52	msgStackErr BYTE  "ERROR: pila desbalanceada.",13,10,0
+	   3A 20 70 69 6C
+	   61 20 64 65 73
+	   62 61 6C 61 6E
+	   63 65 61 64 61
+	   2E 0D 0A 00
+ 00000AD9 20 7C 20 00		msgSep      BYTE  " | ",0
+ 00000ADD 20 7C 20 45 78	msgExist    BYTE  " | Existencia: ",0
+	   69 73 74 65 6E
+	   63 69 61 3A 20
+	   00
+ 00000AED 24 00			msgDollar   BYTE  "$",0
+ 00000AEF 2E 00			msgDot      BYTE  ".",0
+ 00000AF1 30 00			msgZero     BYTE  "0",0
+ 00000AF3 20 4D 58 4E 00	msgMXN      BYTE  " MXN",0
+
+ 00000000			.code
+
+				; ============================================================================
+				; CopyPad : copia una cadena a un campo de tamano fijo y rellena con 0.
+				; Entrada : ESI = origen (cadena terminada en 0), EDI = destino, ECX = tamano
+				;           del campo (incluye el 0 final).
+				; Salida  : campo con a lo mas ECX-1 caracteres + ceros.
+				; Modifica: EFLAGS
+				; ============================================================================
+ 00000000			CopyPad PROC USES eax ecx esi edi
+ 00000000  50		   *	    push   eax
+ 00000001  51		   *	    push   ecx
+ 00000002  56		   *	    push   esi
+ 00000003  57		   *	    push   edi
+ 00000004  49			    dec  ecx                    ; reserva el byte del terminador
+ 00000005			cp_loop:
+ 00000005  85 C9		    test ecx, ecx
+ 00000007  74 0D		    jz   cp_fin
+ 00000009  8A 06		    mov  al, [esi]
+ 0000000B  84 C0		    test al, al
+ 0000000D  74 07		    jz   cp_fin
+ 0000000F  88 07		    mov  [edi], al
+ 00000011  46			    inc  esi
+ 00000012  47			    inc  edi
+ 00000013  49			    dec  ecx
+ 00000014  EB EF		    jmp  cp_loop
+ 00000016			cp_fin:
+ 00000016  41			    inc  ecx                    ; bytes restantes (>=1) a poner en cero
+ 00000017			cp_zero:
+ 00000017  C6 07 00		    mov  BYTE PTR [edi], 0
+ 0000001A  47			    inc  edi
+ 0000001B  49			    dec  ecx
+ 0000001C  75 F9		    jnz  cp_zero
+				    ret
+ 0000001E  5F		   *	    pop    edi
+ 0000001F  5E		   *	    pop    esi
+ 00000020  59		   *	    pop    ecx
+ 00000021  58		   *	    pop    eax
+ 00000022  C3		   *	    ret    00000h
+ 00000023			CopyPad ENDP
+
+				; ============================================================================
+				; ZeroMem : pone en cero un bloque de memoria.
+				; Entrada : EDI = inicio, ECX = numero de bytes.
+				; Modifica: EFLAGS
+				; ============================================================================
+ 00000023			ZeroMem PROC USES eax ecx edi
+ 00000023  50		   *	    push   eax
+ 00000024  51		   *	    push   ecx
+ 00000025  57		   *	    push   edi
+ 00000026  FC			    cld
+ 00000027  32 C0		    xor  al, al
+ 00000029  F3/ AA		    rep  stosb
+				    ret
+ 0000002B  5F		   *	    pop    edi
+ 0000002C  59		   *	    pop    ecx
+ 0000002D  58		   *	    pop    eax
+ 0000002E  C3		   *	    ret    00000h
+ 0000002F			ZeroMem ENDP
+
+				; ============================================================================
+				; ReadLine : captura una linea en inbuf con ReadString.
+				; Salida  : EAX = caracteres leidos; CF=1 si la linea era demasiado larga
+				;           (el resto se descarta leyendo hasta vaciar la linea).
+				; Modifica: EAX, EFLAGS
+				; ============================================================================
+ 0000002F			ReadLine PROC USES edx ecx
+ 0000002F  52		   *	    push   edx
+ 00000030  51		   *	    push   ecx
+ 00000031  BA 000001C9 R	    mov  edx, OFFSET inbuf
+ 00000036  B9 0000003F		    mov  ecx, INBUF_MAX         ; max de caracteres (buffer = ECX+1 bytes)
+ 0000003B  E8 00000000 E	    call ReadString             ; EAX = numero de caracteres capturados
+ 00000040  83 F8 3F		    cmp  eax, INBUF_MAX
+ 00000043  72 1C		    jb   rl_ok
+ 00000045			rl_drain:
+ 00000045  BA 00000209 R	    mov  edx, OFFSET junkbuf
+ 0000004A  B9 0000003F		    mov  ecx, INBUF_MAX
+ 0000004F  E8 00000000 E	    call ReadString
+ 00000054  83 F8 3F		    cmp  eax, INBUF_MAX
+ 00000057  73 EC		    jae  rl_drain
+ 00000059  B8 0000003F		    mov  eax, INBUF_MAX
+ 0000005E  F9			    stc
+ 0000005F  EB 01		    jmp  rl_done
+ 00000061			rl_ok:
+ 00000061  F8			    clc
+ 00000062			rl_done:
+				    ret
+ 00000062  59		   *	    pop    ecx
+ 00000063  5A		   *	    pop    edx
+ 00000064  C3		   *	    ret    00000h
+ 00000065			ReadLine ENDP
+
+				; ============================================================================
+				; GetInput : ReadLine + rechazo de entrada vacia o demasiado larga.
+				; Salida  : EAX = longitud; CF=1 si hay error (ya muestra el mensaje).
+				; Modifica: EAX, EFLAGS
+				; ============================================================================
+ 00000065			GetInput PROC
+ 00000065  E8 FFFFFFC5		    call ReadLine
+ 0000006A  72 04		    jc   gi_bad
+ 0000006C  85 C0		    test eax, eax
+ 0000006E  75 0E		    jnz  gi_ok
+ 00000070			gi_bad:
+				    Fail msgBadInput
+ 00000070  52		     2	    push edx
+ 00000071  BA 0000055F R     2	    mov  edx, OFFSET msgBadInput
+ 00000076  E8 00000000 E     2	    call WriteString
+ 0000007B  5A		     2	    pop  edx
+ 0000007C  F9		     1	    stc
+ 0000007D  C3		     1	    ret
+ 0000007E			gi_ok:
+ 0000007E  F8			    clc
+ 0000007F  C3			    ret
+ 00000080			GetInput ENDP
+
+				; ============================================================================
+				; ParseUInt : cadena de digitos -> entero sin signo (solo '0'..'9').
+				; Entrada : ESI = cadena terminada en 0.
+				; Salida  : EAX = valor; CF=1 si vacia, con caracteres no permitidos o si
+				;           desborda 32 bits.
+				; Modifica: EAX, EFLAGS (ESI se conserva)
+				; ============================================================================
+ 00000080			ParseUInt PROC USES ebx ecx edx esi
+ 00000080  53		   *	    push   ebx
+ 00000081  51		   *	    push   ecx
+ 00000082  52		   *	    push   edx
+ 00000083  56		   *	    push   esi
+ 00000084  33 C0		    xor  eax, eax
+ 00000086  33 C9		    xor  ecx, ecx               ; contador de digitos
+ 00000088			pu_loop:
+ 00000088  0F B6 1E		    movzx ebx, BYTE PTR [esi]
+ 0000008B  84 DB		    test bl, bl
+ 0000008D  74 1E		    jz   pu_end
+				    JNotDigit bl, pu_bad
+ 0000008F  80 FB 30	     2	    cmp  bl, '0'
+ 00000092  72 20	     2	    jb   pu_bad
+ 00000094  80 FB 39	     2	    cmp  bl, '9'
+ 00000097  77 1B	     2	    ja   pu_bad
+ 00000099  83 EB 30		    sub  ebx, '0'
+ 0000009C  BA 0000000A		    mov  edx, 10
+ 000000A1  F7 E2		    mul  edx                    ; EDX:EAX = EAX*10 ; CF=1 si EDX<>0
+ 000000A3  72 0F		    jc   pu_bad
+ 000000A5  03 C3		    add  eax, ebx
+ 000000A7  72 0B		    jc   pu_bad
+ 000000A9  46			    inc  esi
+ 000000AA  41			    inc  ecx
+ 000000AB  EB DB		    jmp  pu_loop
+ 000000AD			pu_end:
+ 000000AD  85 C9		    test ecx, ecx
+ 000000AF  74 03		    jz   pu_bad
+ 000000B1  F8			    clc
+ 000000B2  EB 01		    jmp  pu_done
+ 000000B4			pu_bad:
+ 000000B4  F9			    stc
+ 000000B5			pu_done:
+				    ret
+ 000000B5  5E		   *	    pop    esi
+ 000000B6  5A		   *	    pop    edx
+ 000000B7  59		   *	    pop    ecx
+ 000000B8  5B		   *	    pop    ebx
+ 000000B9  C3		   *	    ret    00000h
+ 000000BA			ParseUInt ENDP
+
+				; ============================================================================
+				; ParseRange : ParseUInt + comprobacion de rango [EDX..ECX].
+				; Entrada : ESI = cadena, EDX = minimo, ECX = maximo.
+				; Salida  : EAX = valor; CF=1 si es invalido o esta fuera de rango.
+				; Modifica: EAX, EFLAGS
+				; ============================================================================
+ 000000BA			ParseRange PROC
+ 000000BA  E8 FFFFFFC1		    call ParseUInt
+ 000000BF  72 0B		    jc   pr_end
+ 000000C1  3B C2		    cmp  eax, edx
+ 000000C3  72 06		    jb   pr_bad
+ 000000C5  3B C1		    cmp  eax, ecx
+ 000000C7  77 02		    ja   pr_bad
+ 000000C9  F8			    clc
+ 000000CA  C3			    ret
+ 000000CB			pr_bad:
+ 000000CB  F9			    stc
+ 000000CC			pr_end:
+ 000000CC  C3			    ret
+ 000000CD			ParseRange ENDP
+
+				; ============================================================================
+				; ParsePrice : "185.50" -> 18550 centavos. Acepta enteros o punto con 1 o 2
+				;              decimales. Rechaza simbolos, separadores de miles, ".5", "5.",
+				;              tercer decimal y fuera de rango (1..999999 centavos).
+				; Entrada : ESI = cadena terminada en 0.
+				; Salida  : EAX = centavos; CF=1 si es invalida.
+				; Modifica: EAX, EFLAGS (ESI se conserva)
+				; ============================================================================
+ 000000CD			ParsePrice PROC USES ebx ecx edx esi
+ 000000CD  53		   *	    push   ebx
+ 000000CE  51		   *	    push   ecx
+ 000000CF  52		   *	    push   edx
+ 000000D0  56		   *	    push   esi
+ 000000D1  33 C0		    xor  eax, eax               ; pesos
+ 000000D3  33 C9		    xor  ecx, ecx               ; digitos enteros
+ 000000D5			pp_int:
+ 000000D5  0F B6 16		    movzx edx, BYTE PTR [esi]
+ 000000D8  84 D2		    test dl, dl
+ 000000DA  74 22		    jz   pp_intEnd
+ 000000DC  80 FA 2E		    cmp  dl, '.'
+ 000000DF  74 1D		    je   pp_intEnd
+				    JNotDigit dl, pp_bad
+ 000000E1  80 FA 30	     2	    cmp  dl, '0'
+ 000000E4  72 6A	     2	    jb   pp_bad
+ 000000E6  80 FA 39	     2	    cmp  dl, '9'
+ 000000E9  77 65	     2	    ja   pp_bad
+ 000000EB  83 EA 30		    sub  edx, '0'
+ 000000EE  6B C0 0A		    imul eax, eax, 10
+ 000000F1  03 C2		    add  eax, edx
+ 000000F3  3D 0000270F		    cmp  eax, 9999              ; evita desbordar y valida el maximo de pesos
+ 000000F8  77 56		    ja   pp_bad
+ 000000FA  46			    inc  esi
+ 000000FB  41			    inc  ecx
+ 000000FC  EB D7		    jmp  pp_int
+ 000000FE			pp_intEnd:
+ 000000FE  85 C9		    test ecx, ecx               ; al menos un digito antes del punto
+ 00000100  74 4E		    jz   pp_bad
+ 00000102  6B D8 64		    imul ebx, eax, 100          ; EBX = pesos*100
+ 00000105  80 3E 00		    cmp  BYTE PTR [esi], 0
+ 00000108  74 34		    je   pp_range               ; sin parte decimal
+ 0000010A  46			    inc  esi                    ; salta el '.'
+ 0000010B  0F B6 16		    movzx edx, BYTE PTR [esi]   ; primer decimal (obligatorio)
+				    JNotDigit dl, pp_bad
+ 0000010E  80 FA 30	     2	    cmp  dl, '0'
+ 00000111  72 3D	     2	    jb   pp_bad
+ 00000113  80 FA 39	     2	    cmp  dl, '9'
+ 00000116  77 38	     2	    ja   pp_bad
+ 00000118  83 EA 30		    sub  edx, '0'
+ 0000011B  6B D2 0A		    imul edx, edx, 10           ; decenas de centavo
+ 0000011E  03 DA		    add  ebx, edx
+ 00000120  46			    inc  esi
+ 00000121  80 3E 00		    cmp  BYTE PTR [esi], 0
+ 00000124  74 18		    je   pp_range               ; un solo decimal: 185.5 -> 18550
+ 00000126  0F B6 16		    movzx edx, BYTE PTR [esi]   ; segundo decimal
+				    JNotDigit dl, pp_bad
+ 00000129  80 FA 30	     2	    cmp  dl, '0'
+ 0000012C  72 22	     2	    jb   pp_bad
+ 0000012E  80 FA 39	     2	    cmp  dl, '9'
+ 00000131  77 1D	     2	    ja   pp_bad
+ 00000133  83 EA 30		    sub  edx, '0'
+ 00000136  03 DA		    add  ebx, edx
+ 00000138  46			    inc  esi
+ 00000139  80 3E 00		    cmp  BYTE PTR [esi], 0      ; un tercer caracter => rechazo
+ 0000013C  75 12		    jne  pp_bad
+ 0000013E			pp_range:
+ 0000013E  83 FB 01		    cmp  ebx, 1
+ 00000141  72 0D		    jb   pp_bad
+ 00000143  81 FB 000F423F	    cmp  ebx, MAX_PRICE
+ 00000149  77 05		    ja   pp_bad
+ 0000014B  8B C3		    mov  eax, ebx
+ 0000014D  F8			    clc
+ 0000014E  EB 01		    jmp  pp_done
+ 00000150			pp_bad:
+ 00000150  F9			    stc
+ 00000151			pp_done:
+				    ret
+ 00000151  5E		   *	    pop    esi
+ 00000152  5A		   *	    pop    edx
+ 00000153  59		   *	    pop    ecx
+ 00000154  5B		   *	    pop    ebx
+ 00000155  C3		   *	    ret    00000h
+ 00000156			ParsePrice ENDP
+
+				; ============================================================================
+				; ToDecStr : convierte EAX a cadena decimal sin signo en numbuf (division
+				;            entre 10). Los digitos salen en orden inverso (residuos), por
+				;            eso se escriben desde el final del buffer hacia atras.
+				; Entrada : EAX = valor.
+				; Salida  : EDX = inicio de la cadena (terminada en 00h).
+				; Modifica: EDX, EFLAGS
+				; ============================================================================
+ 00000156			ToDecStr PROC USES eax ebx edi
+ 00000156  50		   *	    push   eax
+ 00000157  53		   *	    push   ebx
+ 00000158  57		   *	    push   edi
+ 00000159  BF 0000027E R	    mov  edi, OFFSET numbuf + 11
+ 0000015E  C6 07 00		    mov  BYTE PTR [edi], 0      ; terminador 00h
+ 00000161  BB 0000000A		    mov  ebx, 10
+ 00000166			ts_loop:
+ 00000166  33 D2		    xor  edx, edx               ; dividendo = EDX:EAX
+ 00000168  F7 F3		    div  ebx                    ; EAX = cociente, EDX = residuo (0..9)
+ 0000016A  80 C2 30		    add  dl, '0'                ; digito -> ASCII
+ 0000016D  4F			    dec  edi
+ 0000016E  88 17		    mov  [edi], dl
+ 00000170  85 C0		    test eax, eax
+ 00000172  75 F2		    jnz  ts_loop
+ 00000174  8B D7		    mov  edx, edi
+				    ret
+ 00000176  5F		   *	    pop    edi
+ 00000177  5B		   *	    pop    ebx
+ 00000178  58		   *	    pop    eax
+ 00000179  C3		   *	    ret    00000h
+ 0000017A			ToDecStr ENDP
+
+				; ============================================================================
+				; PrintU32 : muestra EAX como decimal sin signo.
+				; Entrada : EAX = valor.
+				; Modifica: EFLAGS
+				; ============================================================================
+ 0000017A			PrintU32 PROC USES edx
+ 0000017A  52		   *	    push   edx
+ 0000017B  E8 FFFFFFD6		    call ToDecStr
+ 00000180  E8 00000000 E	    call WriteString
+				    ret
+ 00000185  5A		   *	    pop    edx
+ 00000186  C3		   *	    ret    00000h
+ 00000187			PrintU32 ENDP
+
+				; ============================================================================
+				; SplitMXN : separa centavos en pesos y centavos (DIV entre 100).
+				; Entrada : EAX = centavos.
+				; Salida  : EAX = pesos, EDX = centavos (0..99).
+				; Modifica: EAX, EDX, EFLAGS
+				; ============================================================================
+ 00000187			SplitMXN PROC USES ebx
+ 00000187  53		   *	    push   ebx
+ 00000188  BB 00000064		    mov  ebx, 100
+ 0000018D  33 D2		    xor  edx, edx
+ 0000018F  F7 F3		    div  ebx
+				    ret
+ 00000191  5B		   *	    pop    ebx
+ 00000192  C3		   *	    ret    00000h
+ 00000193			SplitMXN ENDP
+
+				; ============================================================================
+				; PrintMXN : muestra centavos como "$1234.05 MXN".
+				; Entrada : EAX = centavos.
+				; Modifica: EFLAGS
+				; ============================================================================
+ 00000193			PrintMXN PROC USES eax edx
+				    Say  msgDollar
+ 00000193  50		   *	    push   eax
+ 00000194  52		   *	    push   edx
+ 00000195  52		     1	    push edx
+ 00000196  BA 00000AED R     1	    mov  edx, OFFSET msgDollar
+ 0000019B  E8 00000000 E     1	    call WriteString
+ 000001A0  5A		     1	    pop  edx
+ 000001A1  E8 FFFFFFE1		    call SplitMXN               ; EAX = pesos, EDX = centavos
+ 000001A6  52			    push edx                    ; guarda centavos
+ 000001A7  E8 FFFFFFCE		    call PrintU32               ; pesos
+				    Say  msgDot
+ 000001AC  52		     1	    push edx
+ 000001AD  BA 00000AEF R     1	    mov  edx, OFFSET msgDot
+ 000001B2  E8 00000000 E     1	    call WriteString
+ 000001B7  5A		     1	    pop  edx
+ 000001B8  58			    pop  eax                    ; centavos
+ 000001B9  83 F8 0A		    cmp  eax, 10
+ 000001BC  73 0C		    jae  pm_two
+				    Say  msgZero                ; residuo 5 -> "05"
+ 000001BE  52		     1	    push edx
+ 000001BF  BA 00000AF1 R     1	    mov  edx, OFFSET msgZero
+ 000001C4  E8 00000000 E     1	    call WriteString
+ 000001C9  5A		     1	    pop  edx
+ 000001CA			pm_two:
+ 000001CA  E8 FFFFFFAB		    call PrintU32
+				    Say  msgMXN
+ 000001CF  52		     1	    push edx
+ 000001D0  BA 00000AF3 R     1	    mov  edx, OFFSET msgMXN
+ 000001D5  E8 00000000 E     1	    call WriteString
+ 000001DA  5A		     1	    pop  edx
+				    ret
+ 000001DB  5A		   *	    pop    edx
+ 000001DC  58		   *	    pop    eax
+ 000001DD  C3		   *	    ret    00000h
+ 000001DE			PrintMXN ENDP
+
+				; ============================================================================
+				; ValidateCode : valida ABC-123 (3 mayusculas, guion, 3 digitos, fin de cadena)
+				; Entrada : ESI = cadena.
+				; Salida  : CF=1 si es invalida.
+				; Modifica: EFLAGS (ESI se conserva)
+				; ============================================================================
+ 000001DE			ValidateCode PROC USES eax ecx esi
+ 000001DE  50		   *	    push   eax
+ 000001DF  51		   *	    push   ecx
+ 000001E0  56		   *	    push   esi
+ 000001E1  B9 00000003		    mov  ecx, 3
+ 000001E6			vc_l1:
+ 000001E6  8A 06		    mov  al, [esi]
+				    JNotRange al, 'A', 'Z', vc_bad
+ 000001E8  3C 41	     1	    cmp  al, 'A'
+ 000001EA  72 28	     1	    jb   vc_bad
+ 000001EC  3C 5A	     1	    cmp  al, 'Z'
+ 000001EE  77 24	     1	    ja   vc_bad
+ 000001F0  46			    inc  esi
+ 000001F1  E2 F3		    loop vc_l1
+ 000001F3  8A 06		    mov  al, [esi]
+ 000001F5  3C 2D		    cmp  al, '-'
+ 000001F7  75 1B		    jne  vc_bad
+ 000001F9  46			    inc  esi
+ 000001FA  B9 00000003		    mov  ecx, 3
+ 000001FF			vc_l2:
+ 000001FF  8A 06		    mov  al, [esi]
+				    JNotDigit al, vc_bad
+ 00000201  3C 30	     2	    cmp  al, '0'
+ 00000203  72 0F	     2	    jb   vc_bad
+ 00000205  3C 39	     2	    cmp  al, '9'
+ 00000207  77 0B	     2	    ja   vc_bad
+ 00000209  46			    inc  esi
+ 0000020A  E2 F3		    loop vc_l2
+ 0000020C  80 3E 00		    cmp  BYTE PTR [esi], 0
+ 0000020F  75 03		    jne  vc_bad
+ 00000211  F8			    clc
+ 00000212  EB 01		    jmp  vc_done
+ 00000214			vc_bad:
+ 00000214  F9			    stc
+ 00000215			vc_done:
+				    ret
+ 00000215  5E		   *	    pop    esi
+ 00000216  59		   *	    pop    ecx
+ 00000217  58		   *	    pop    eax
+ 00000218  C3		   *	    ret    00000h
+ 00000219			ValidateCode ENDP
+
+				; ============================================================================
+				; ValidateName : 1 a 25 caracteres ASCII imprimibles y terminador 0.
+				; Entrada : ESI = cadena.
+				; Salida  : CF=1 si es invalida.
+				; Modifica: EFLAGS (ESI se conserva)
+				; ============================================================================
+ 00000219			ValidateName PROC USES eax ecx esi
+ 00000219  50		   *	    push   eax
+ 0000021A  51		   *	    push   ecx
+ 0000021B  56		   *	    push   esi
+ 0000021C  33 C9		    xor  ecx, ecx
+ 0000021E			vn_loop:
+ 0000021E  8A 06		    mov  al, [esi]
+ 00000220  84 C0		    test al, al
+ 00000222  74 11		    jz   vn_end
+				    JNotRange al, 32, 126, vn_bad
+ 00000224  3C 20	     1	    cmp  al, 32
+ 00000226  72 14	     1	    jb   vn_bad
+ 00000228  3C 7E	     1	    cmp  al, 126
+ 0000022A  77 10	     1	    ja   vn_bad
+ 0000022C  46			    inc  esi
+ 0000022D  41			    inc  ecx
+ 0000022E  83 F9 19		    cmp  ecx, 25
+ 00000231  76 EB		    jbe  vn_loop
+ 00000233  EB 07		    jmp  vn_bad                 ; mas de 25 caracteres
+ 00000235			vn_end:
+ 00000235  85 C9		    test ecx, ecx
+ 00000237  74 03		    jz   vn_bad                 ; vacio
+ 00000239  F8			    clc
+ 0000023A  EB 01		    jmp  vn_done
+ 0000023C			vn_bad:
+ 0000023C  F9			    stc
+ 0000023D			vn_done:
+				    ret
+ 0000023D  5E		   *	    pop    esi
+ 0000023E  59		   *	    pop    ecx
+ 0000023F  58		   *	    pop    eax
+ 00000240  C3		   *	    ret    00000h
+ 00000241			ValidateName ENDP
+
+				; ============================================================================
+				; ValidateRecord : valida un registro completo (codigo, nombre, precio, stock)
+				; Entrada : ESI = inicio del registro.
+				; Salida  : CF=1 si es invalido.
+				; Modifica: EFLAGS (ESI se conserva)
+				; ============================================================================
+ 00000241			ValidateRecord PROC USES eax esi
+ 00000241  50		   *	    push   eax
+ 00000242  56		   *	    push   esi
+ 00000243  E8 FFFFFF96		    call ValidateCode           ; codigo en offset 0
+ 00000248  72 27		    jc   vr_bad
+ 0000024A  83 C6 08		    add  esi, OFF_NAME
+ 0000024D  E8 FFFFFFC7		    call ValidateName
+ 00000252  72 1D		    jc   vr_bad
+ 00000254  83 EE 08		    sub  esi, OFF_NAME
+ 00000257  8B 46 24		    mov  eax, [esi+OFF_PRICE]
+ 0000025A  83 F8 01		    cmp  eax, 1
+ 0000025D  72 12		    jb   vr_bad
+ 0000025F  3D 000F423F		    cmp  eax, MAX_PRICE
+ 00000264  77 0B		    ja   vr_bad
+ 00000266  8B 46 28		    mov  eax, [esi+OFF_STOCK]
+ 00000269  83 F8 64		    cmp  eax, MAX_STOCK
+ 0000026C  77 03		    ja   vr_bad
+ 0000026E  F8			    clc
+ 0000026F  EB 01		    jmp  vr_done
+ 00000271			vr_bad:
+ 00000271  F9			    stc
+ 00000272			vr_done:
+				    ret
+ 00000272  5E		   *	    pop    esi
+ 00000273  58		   *	    pop    eax
+ 00000274  C3		   *	    ret    00000h
+ 00000275			ValidateRecord ENDP
+
+				; ============================================================================
+				; CodesEqual : compara los 7 caracteres de dos codigos.
+				; Entrada : ESI, EDI = codigos.
+				; Salida  : ZF=1 si son iguales.
+				; Modifica: EFLAGS
+				; ============================================================================
+ 00000275			CodesEqual PROC USES eax ecx esi edi
+ 00000275  50		   *	    push   eax
+ 00000276  51		   *	    push   ecx
+ 00000277  56		   *	    push   esi
+ 00000278  57		   *	    push   edi
+ 00000279  B9 00000007		    mov  ecx, 7
+ 0000027E			ce_loop:
+ 0000027E  8A 06		    mov  al, [esi]
+ 00000280  3A 07		    cmp  al, [edi]
+ 00000282  75 06		    jne  ce_done                ; ZF=0
+ 00000284  46			    inc  esi
+ 00000285  47			    inc  edi
+ 00000286  E2 F6		    loop ce_loop
+ 00000288  33 C0		    xor  eax, eax               ; llegaron los 7 iguales: fuerza ZF=1
+ 0000028A			ce_done:
+				    ret                         ; los POP del epilogo no alteran las banderas
+ 0000028A  5F		   *	    pop    edi
+ 0000028B  5E		   *	    pop    esi
+ 0000028C  59		   *	    pop    ecx
+ 0000028D  58		   *	    pop    eax
+ 0000028E  C3		   *	    ret    00000h
+ 0000028F			CodesEqual ENDP
+
+				; ============================================================================
+				; FindProduct : busca un codigo en el catalogo (recorrido con ESI).
+				; Entrada : EDI = codigo (cadena).
+				; Salida  : CF=0 y ESI = registro encontrado; CF=1 si no existe.
+				; Modifica: ESI, EFLAGS
+				; ============================================================================
+ 0000028F			FindProduct PROC USES ecx
+ 0000028F  51		   *	    push   ecx
+ 00000290  BE 00000008 R	    mov  esi, OFFSET products
+ 00000295  8B 0D 00000004 R	    mov  ecx, prodCount
+ 0000029B  85 C9		    test ecx, ecx
+ 0000029D  74 0D		    jz   fp_nf
+ 0000029F			fp_loop:
+ 0000029F  E8 FFFFFFD1		    call CodesEqual
+ 000002A4  74 09		    je   fp_found
+ 000002A6  83 C6 2C		    add  esi, REC_SIZE
+ 000002A9  49			    dec  ecx
+ 000002AA  75 F3		    jnz  fp_loop
+ 000002AC			fp_nf:
+ 000002AC  F9			    stc
+				    ret
+ 000002AD  59		   *	    pop    ecx
+ 000002AE  C3		   *	    ret    00000h
+ 000002AF			fp_found:
+ 000002AF  F8			    clc
+				    ret
+ 000002B0  59		   *	    pop    ecx
+ 000002B1  C3		   *	    ret    00000h
+ 000002B2			FindProduct ENDP
+
+				; ============================================================================
+				; ShowRecord : imprime un producto.
+				; Entrada : ESI = registro.
+				; Modifica: EFLAGS
+				; ============================================================================
+ 000002B2			ShowRecord PROC USES eax edx
+ 000002B2  50		   *	    push   eax
+ 000002B3  52		   *	    push   edx
+ 000002B4  8B D6		    mov  edx, esi               ; codigo (offset 0)
+ 000002B6  E8 00000000 E	    call WriteString
+				    Say  msgSep
+ 000002BB  52		     1	    push edx
+ 000002BC  BA 00000AD9 R     1	    mov  edx, OFFSET msgSep
+ 000002C1  E8 00000000 E     1	    call WriteString
+ 000002C6  5A		     1	    pop  edx
+ 000002C7  8D 56 08		    lea  edx, [esi+OFF_NAME]
+ 000002CA  E8 00000000 E	    call WriteString
+				    Say  msgSep
+ 000002CF  52		     1	    push edx
+ 000002D0  BA 00000AD9 R     1	    mov  edx, OFFSET msgSep
+ 000002D5  E8 00000000 E     1	    call WriteString
+ 000002DA  5A		     1	    pop  edx
+ 000002DB  8B 46 24		    mov  eax, [esi+OFF_PRICE]
+ 000002DE  E8 FFFFFEB0		    call PrintMXN
+				    ShowU32 msgExist, [esi+OFF_STOCK]
+ 000002E3  52		     2	    push edx
+ 000002E4  BA 00000ADD R     2	    mov  edx, OFFSET msgExist
+ 000002E9  E8 00000000 E     2	    call WriteString
+ 000002EE  5A		     2	    pop  edx
+ 000002EF  8B 46 28	     2	    mov  eax, [esi+OFF_STOCK]
+ 000002F2  E8 FFFFFE83	     2	    call PrintU32
+ 000002F7  E8 00000000 E     1	    call Crlf
+				    ret
+ 000002FC  5A		   *	    pop    edx
+ 000002FD  58		   *	    pop    eax
+ 000002FE  C3		   *	    ret    00000h
+ 000002FF			ShowRecord ENDP
+
+				; ============================================================================
+				; AskProduct : pide un codigo, lo valida y lo localiza.
+				; Salida  : CF=0 y ESI = registro; CF=1 si hubo error (mensaje ya mostrado).
+				; Modifica: ESI, EFLAGS
+				; ============================================================================
+ 000002FF			AskProduct PROC USES eax edi        ; ESI es resultado -> fuera de USES
+				    AskCheck msgAskCode, ValidateCode, ap_badfmt, ap_err
+ 000002FF  50		   *	    push   eax
+ 00000300  57		   *	    push   edi
+ 00000301  52		     3	    push edx
+ 00000302  BA 00000597 R     3	    mov  edx, OFFSET msgAskCode
+ 00000307  E8 00000000 E     3	    call WriteString
+ 0000030C  5A		     3	    pop  edx
+ 0000030D  E8 FFFFFD53	     2	    call GetInput
+ 00000312  BE 000001C9 R     2	    mov  esi, OFFSET inbuf
+ 00000317  72 37	     1	    jc   ap_err
+ 00000319  E8 FFFFFEC0	     1	    call ValidateCode
+ 0000031E  72 10	     1	    jc   ap_badfmt
+ 00000320  BF 000001C9 R	    mov  edi, OFFSET inbuf
+ 00000325  E8 FFFFFF65		    call FindProduct
+ 0000032A  72 14		    jc   ap_nf
+ 0000032C  F8			    clc
+				    ret
+ 0000032D  5F		   *	    pop    edi
+ 0000032E  58		   *	    pop    eax
+ 0000032F  C3		   *	    ret    00000h
+ 00000330			ap_badfmt:
+				    Fail msgBadCode
+ 00000330  52		     2	    push edx
+ 00000331  BA 00000618 R     2	    mov  edx, OFFSET msgBadCode
+ 00000336  E8 00000000 E     2	    call WriteString
+ 0000033B  5A		     2	    pop  edx
+ 0000033C  F9		     1	    stc
+ 0000033D  5F		   *	    pop    edi
+ 0000033E  58		   *	    pop    eax
+ 0000033F  C3		   *	    ret    00000h
+ 00000340			ap_nf:
+				    Fail msgNotFound
+ 00000340  52		     2	    push edx
+ 00000341  BA 0000067B R     2	    mov  edx, OFFSET msgNotFound
+ 00000346  E8 00000000 E     2	    call WriteString
+ 0000034B  5A		     2	    pop  edx
+ 0000034C  F9		     1	    stc
+ 0000034D  5F		   *	    pop    edi
+ 0000034E  58		   *	    pop    eax
+ 0000034F  C3		   *	    ret    00000h
+ 00000350			ap_err:
+ 00000350  F9			    stc
+				    ret
+ 00000351  5F		   *	    pop    edi
+ 00000352  58		   *	    pop    eax
+ 00000353  C3		   *	    ret    00000h
+ 00000354			AskProduct ENDP
+
+				; ============================================================================
+				; AskQuantity : pide una cantidad entera 1..100.
+				; Salida  : EAX = cantidad; CF=1 si es invalida (mensaje ya mostrado).
+				; Modifica: EAX, EFLAGS (ESI, ECX y EDX se conservan)
+				; ============================================================================
+ 00000354			AskQuantity PROC USES ecx edx esi
+				    Ask  msgAskQty
+ 00000354  51		   *	    push   ecx
+ 00000355  52		   *	    push   edx
+ 00000356  56		   *	    push   esi
+ 00000357  52		     2	    push edx
+ 00000358  BA 00000603 R     2	    mov  edx, OFFSET msgAskQty
+ 0000035D  E8 00000000 E     2	    call WriteString
+ 00000362  5A		     2	    pop  edx
+ 00000363  E8 FFFFFCFD	     1	    call GetInput
+ 00000368  BE 000001C9 R     1	    mov  esi, OFFSET inbuf
+ 0000036D  72 26		    jc   aq_err
+				    ParseBetween 1, MAX_STOCK
+ 0000036F  BA 00000001	     1	    mov  edx, 1
+ 00000374  B9 00000064	     1	    mov  ecx, MAX_STOCK
+ 00000379  E8 FFFFFD3C	     1	    call ParseRange
+ 0000037E  72 04		    jc   aq_inv
+				    ret                         ; ParseRange dejo CF=0
+ 00000380  5E		   *	    pop    esi
+ 00000381  5A		   *	    pop    edx
+ 00000382  59		   *	    pop    ecx
+ 00000383  C3		   *	    ret    00000h
+ 00000384			aq_inv:
+				    Fail msgBadQty
+ 00000384  52		     2	    push edx
+ 00000385  BA 00000730 R     2	    mov  edx, OFFSET msgBadQty
+ 0000038A  E8 00000000 E     2	    call WriteString
+ 0000038F  5A		     2	    pop  edx
+ 00000390  F9		     1	    stc
+ 00000391  5E		   *	    pop    esi
+ 00000392  5A		   *	    pop    edx
+ 00000393  59		   *	    pop    ecx
+ 00000394  C3		   *	    ret    00000h
+ 00000395			aq_err:
+ 00000395  F9			    stc
+				    ret
+ 00000396  5E		   *	    pop    esi
+ 00000397  5A		   *	    pop    edx
+ 00000398  59		   *	    pop    ecx
+ 00000399  C3		   *	    ret    00000h
+ 0000039A			AskQuantity ENDP
+
+				; ============================================================================
+				; ConfirmYN : lee una respuesta S/N.
+				; Salida  : CF=0 si respondio S/s; CF=1 en cualquier otro caso.
+				; Modifica: EAX, EFLAGS
+				; ============================================================================
+ 0000039A			ConfirmYN PROC
+ 0000039A  E8 FFFFFC90		    call ReadLine
+ 0000039F  72 12		    jc   cy_no
+ 000003A1  83 F8 01		    cmp  eax, 1
+ 000003A4  75 0D		    jne  cy_no
+ 000003A6  A0 000001C9 R	    mov  al, [inbuf]
+ 000003AB  0C 20		    or   al, 20h                ; a minuscula
+ 000003AD  3C 73		    cmp  al, 's'
+ 000003AF  75 02		    jne  cy_no
+ 000003B1  F8			    clc
+ 000003B2  C3			    ret
+ 000003B3			cy_no:
+ 000003B3  F9			    stc
+ 000003B4  C3			    ret
+ 000003B5			ConfirmYN ENDP
+
+				; ============================================================================
+				; ConfirmDiscard : si hay cambios sin guardar pide confirmacion.
+				; Salida  : CF=0 si se puede continuar; CF=1 si el usuario no confirma.
+				; Modifica: EAX, EFLAGS
+				; ============================================================================
+ 000003B5			ConfirmDiscard PROC
+ 000003B5  80 3D 000001C4 R	    cmp  dirty, 0
+	   00
+ 000003BC  74 12		    je   cf_ok
+				    Say  msgUnsaved
+ 000003BE  52		     1	    push edx
+ 000003BF  BA 00000A81 R     1	    mov  edx, OFFSET msgUnsaved
+ 000003C4  E8 00000000 E     1	    call WriteString
+ 000003C9  5A		     1	    pop  edx
+ 000003CA  E8 FFFFFFCB		    call ConfirmYN              ; CF=0 si respondio S
+ 000003CF  C3			    ret
+ 000003D0			cf_ok:
+ 000003D0  F8			    clc
+ 000003D1  C3			    ret
+ 000003D2			ConfirmDiscard ENDP
+
+				; ============================================================================
+				; DoRegister : alta de producto. Todo se valida y se guarda en variables
+				;              temporales; el catalogo solo cambia al final (sin cambios
+				;              parciales).
+				; Modifica: EAX, EBX, ECX, EDX, ESI, EDI, EFLAGS
+				; ============================================================================
+ 000003D2			DoRegister PROC
+ 000003D2  83 3D 00000004 R	    cmp  prodCount, PROD_MAX
+	   0A
+ 000003D9  72 0D		    jb   dr_space
+				    Reject msgFull
+ 000003DB  52		     2	    push edx
+ 000003DC  BA 0000075A R     2	    mov  edx, OFFSET msgFull
+ 000003E1  E8 00000000 E     2	    call WriteString
+ 000003E6  5A		     2	    pop  edx
+ 000003E7  C3		     1	    ret
+ 000003E8			dr_space:
+				    AskCheck msgAskCode, ValidateCode, dr_badcode, dr_end
+ 000003E8  52		     3	    push edx
+ 000003E9  BA 00000597 R     3	    mov  edx, OFFSET msgAskCode
+ 000003EE  E8 00000000 E     3	    call WriteString
+ 000003F3  5A		     3	    pop  edx
+ 000003F4  E8 FFFFFC6C	     2	    call GetInput
+ 000003F9  BE 000001C9 R     2	    mov  esi, OFFSET inbuf
+ 000003FE  0F 82 0000016A    1	    jc   dr_end
+ 00000404  E8 FFFFFDD5	     1	    call ValidateCode
+ 00000409  0F 82 0000011F    1	    jc   dr_badcode
+ 0000040F  BF 000001C9 R	    mov  edi, OFFSET inbuf
+ 00000414  E8 FFFFFE76		    call FindProduct
+ 00000419  0F 83 0000011C	    jnc  dr_dup
+				    CopyField inbuf, tmpCode, CODE_SIZE
+ 0000041F  BE 000001C9 R     1	    mov  esi, OFFSET inbuf
+ 00000424  8D 3D 00000249 R  1	    lea  edi, tmpCode
+ 0000042A  B9 00000008	     1	    mov  ecx, CODE_SIZE
+ 0000042F  E8 FFFFFBCC	     1	    call CopyPad
+				    AskCheck msgAskName, ValidateName, dr_badname, dr_end
+ 00000434  52		     3	    push edx
+ 00000435  BA 000005AA R     3	    mov  edx, OFFSET msgAskName
+ 0000043A  E8 00000000 E     3	    call WriteString
+ 0000043F  5A		     3	    pop  edx
+ 00000440  E8 FFFFFC20	     2	    call GetInput
+ 00000445  BE 000001C9 R     2	    mov  esi, OFFSET inbuf
+ 0000044A  0F 82 0000011E    1	    jc   dr_end
+ 00000450  E8 FFFFFDC4	     1	    call ValidateName
+ 00000455  0F 82 000000ED    1	    jc   dr_badname
+				    CopyField inbuf, tmpName, NAME_SIZE
+ 0000045B  BE 000001C9 R     1	    mov  esi, OFFSET inbuf
+ 00000460  8D 3D 00000251 R  1	    lea  edi, tmpName
+ 00000466  B9 0000001A	     1	    mov  ecx, NAME_SIZE
+ 0000046B  E8 FFFFFB90	     1	    call CopyPad
+				    AskCheck msgAskPrice, ParsePrice, dr_badprice, dr_end
+ 00000470  52		     3	    push edx
+ 00000471  BA 000005C7 R     3	    mov  edx, OFFSET msgAskPrice
+ 00000476  E8 00000000 E     3	    call WriteString
+ 0000047B  5A		     3	    pop  edx
+ 0000047C  E8 FFFFFBE4	     2	    call GetInput
+ 00000481  BE 000001C9 R     2	    mov  esi, OFFSET inbuf
+ 00000486  0F 82 000000E2    1	    jc   dr_end
+ 0000048C  E8 FFFFFC3C	     1	    call ParsePrice
+ 00000491  0F 82 000000BE    1	    jc   dr_badprice
+ 00000497  A3 0000026B R	    mov  tmpPrice, eax
+				    Ask  msgAskStock
+ 0000049C  52		     2	    push edx
+ 0000049D  BA 000005E4 R     2	    mov  edx, OFFSET msgAskStock
+ 000004A2  E8 00000000 E     2	    call WriteString
+ 000004A7  5A		     2	    pop  edx
+ 000004A8  E8 FFFFFBB8	     1	    call GetInput
+ 000004AD  BE 000001C9 R     1	    mov  esi, OFFSET inbuf
+ 000004B2  0F 82 000000B6	    jc   dr_end
+				    ParseBetween 0, MAX_STOCK
+ 000004B8  BA 00000000	     1	    mov  edx, 0
+ 000004BD  B9 00000064	     1	    mov  ecx, MAX_STOCK
+ 000004C2  E8 FFFFFBF3	     1	    call ParseRange
+ 000004C7  0F 82 00000095	    jc   dr_badstock
+ 000004CD  A3 0000026F R	    mov  tmpStock, eax
+				    ; --- confirmacion: se escribe el registro en la tabla ---
+				    RecAddr ebx, products, prodCount    ; EBX = registro destino
+ 000004D2  8B 1D 00000004 R  1	    mov  ebx, prodCount
+ 000004D8  6B DB 2C	     1	    imul ebx, ebx, REC_SIZE
+ 000004DB  81 C3 00000008 R  1	    add  ebx, OFFSET products
+				    CopyField tmpCode, [ebx], CODE_SIZE
+ 000004E1  BE 00000249 R     1	    mov  esi, OFFSET tmpCode
+ 000004E6  8D 3B	     1	    lea  edi, [ebx]
+ 000004E8  B9 00000008	     1	    mov  ecx, CODE_SIZE
+ 000004ED  E8 FFFFFB0E	     1	    call CopyPad
+				    CopyField tmpName, [ebx+OFF_NAME], NAME_SIZE
+ 000004F2  BE 00000251 R     1	    mov  esi, OFFSET tmpName
+ 000004F7  8D 7B 08	     1	    lea  edi, [ebx+OFF_NAME]
+ 000004FA  B9 0000001A	     1	    mov  ecx, NAME_SIZE
+ 000004FF  E8 FFFFFAFC	     1	    call CopyPad
+ 00000504  A1 0000026B R	    mov  eax, tmpPrice
+ 00000509  89 43 24		    mov  [ebx+OFF_PRICE], eax
+ 0000050C  A1 0000026F R	    mov  eax, tmpStock
+ 00000511  89 43 28		    mov  [ebx+OFF_STOCK], eax
+ 00000514  FF 05 00000004 R	    inc  prodCount
+ 0000051A  C6 05 000001C4 R	    mov  dirty, 1
+	   01
+				    Reject msgRegOk
+ 00000521  52		     2	    push edx
+ 00000522  BA 00000791 R     2	    mov  edx, OFFSET msgRegOk
+ 00000527  E8 00000000 E     2	    call WriteString
+ 0000052C  5A		     2	    pop  edx
+ 0000052D  C3		     1	    ret
+ 0000052E			dr_badcode:
+				    Reject msgBadCode
+ 0000052E  52		     2	    push edx
+ 0000052F  BA 00000618 R     2	    mov  edx, OFFSET msgBadCode
+ 00000534  E8 00000000 E     2	    call WriteString
+ 00000539  5A		     2	    pop  edx
+ 0000053A  C3		     1	    ret
+ 0000053B			dr_dup:
+				    Reject msgDup
+ 0000053B  52		     2	    push edx
+ 0000053C  BA 00000652 R     2	    mov  edx, OFFSET msgDup
+ 00000541  E8 00000000 E     2	    call WriteString
+ 00000546  5A		     2	    pop  edx
+ 00000547  C3		     1	    ret
+ 00000548			dr_badname:
+				    Reject msgBadName
+ 00000548  52		     2	    push edx
+ 00000549  BA 00000695 R     2	    mov  edx, OFFSET msgBadName
+ 0000054E  E8 00000000 E     2	    call WriteString
+ 00000553  5A		     2	    pop  edx
+ 00000554  C3		     1	    ret
+ 00000555			dr_badprice:
+				    Reject msgBadPrice
+ 00000555  52		     2	    push edx
+ 00000556  BA 000006BD R     2	    mov  edx, OFFSET msgBadPrice
+ 0000055B  E8 00000000 E     2	    call WriteString
+ 00000560  5A		     2	    pop  edx
+ 00000561  C3		     1	    ret
+ 00000562			dr_badstock:
+				    Say  msgBadStock
+ 00000562  52		     1	    push edx
+ 00000563  BA 00000704 R     1	    mov  edx, OFFSET msgBadStock
+ 00000568  E8 00000000 E     1	    call WriteString
+ 0000056D  5A		     1	    pop  edx
+ 0000056E			dr_end:
+ 0000056E  C3			    ret
+ 0000056F			DoRegister ENDP
+
+				; ============================================================================
+				; DoShowAll : muestra el inventario recorriendo la tabla con ESI.
+				; Modifica: ECX, ESI, EFLAGS
+				; ============================================================================
+ 0000056F			DoShowAll PROC
+ 0000056F  8B 0D 00000004 R	    mov  ecx, prodCount
+ 00000575  85 C9		    test ecx, ecx
+ 00000577  75 0D		    jnz  sa_go
+				    Reject msgEmpty
+ 00000579  52		     2	    push edx
+ 0000057A  BA 000007A8 R     2	    mov  edx, OFFSET msgEmpty
+ 0000057F  E8 00000000 E     2	    call WriteString
+ 00000584  5A		     2	    pop  edx
+ 00000585  C3		     1	    ret
+ 00000586			sa_go:
+ 00000586  BE 00000008 R	    mov  esi, OFFSET products
+ 0000058B			sa_loop:
+ 0000058B  E8 FFFFFD22		    call ShowRecord
+ 00000590  83 C6 2C		    add  esi, REC_SIZE
+ 00000593  E2 F6		    loop sa_loop
+ 00000595  C3			    ret
+ 00000596			DoShowAll ENDP
+
+				; ============================================================================
+				; DoSearch : busca por codigo y muestra el producto.
+				; Modifica: ESI, EFLAGS
+				; ============================================================================
+ 00000596			DoSearch PROC
+ 00000596  E8 FFFFFD64		    call AskProduct
+ 0000059B  72 05		    jc   ds_end
+ 0000059D  E8 FFFFFD10		    call ShowRecord
+ 000005A2			ds_end:
+ 000005A2  C3			    ret
+ 000005A3			DoSearch ENDP
+
+				; ============================================================================
+				; DoReceive : suma unidades a un producto existente (maximo 100).
+				; Modifica: EAX, ECX, ESI, EFLAGS
+				; ============================================================================
+ 000005A3			DoReceive PROC
+ 000005A3  E8 FFFFFD57		    call AskProduct
+ 000005A8  72 4F		    jc   rv_end
+ 000005AA  E8 FFFFFDA5		    call AskQuantity            ; EAX = cantidad (ESI se conserva)
+ 000005AF  72 48		    jc   rv_end
+ 000005B1  8B 4E 28		    mov  ecx, [esi+OFF_STOCK]
+ 000005B4  03 C8		    add  ecx, eax
+ 000005B6  72 28		    jc   rv_ovf
+ 000005B8  83 F9 64		    cmp  ecx, MAX_STOCK
+ 000005BB  77 30		    ja   rv_excess
+ 000005BD  89 4E 28		    mov  [esi+OFF_STOCK], ecx   ; se actualiza solo si todo es valido
+ 000005C0  C6 05 000001C4 R	    mov  dirty, 1
+	   01
+				    ShowU32 msgRecvOk, ecx
+ 000005C7  52		     2	    push edx
+ 000005C8  BA 000007F9 R     2	    mov  edx, OFFSET msgRecvOk
+ 000005CD  E8 00000000 E     2	    call WriteString
+ 000005D2  5A		     2	    pop  edx
+ 000005D3  8B C1	     2	    mov  eax, ecx
+ 000005D5  E8 FFFFFBA0	     2	    call PrintU32
+ 000005DA  E8 00000000 E     1	    call Crlf
+ 000005DF  C3			    ret
+ 000005E0			rv_ovf:
+				    Reject msgOvf
+ 000005E0  52		     2	    push edx
+ 000005E1  BA 0000084F R     2	    mov  edx, OFFSET msgOvf
+ 000005E6  E8 00000000 E     2	    call WriteString
+ 000005EB  5A		     2	    pop  edx
+ 000005EC  C3		     1	    ret
+ 000005ED			rv_excess:
+				    Say  msgExcess
+ 000005ED  52		     1	    push edx
+ 000005EE  BA 000007BC R     1	    mov  edx, OFFSET msgExcess
+ 000005F3  E8 00000000 E     1	    call WriteString
+ 000005F8  5A		     1	    pop  edx
+ 000005F9			rv_end:
+ 000005F9  C3			    ret
+ 000005FA			DoReceive ENDP
+
+				; ============================================================================
+				; CalcDiscount : regla de descuento por cantidad.
+				;   descuento = base*10/100 si cantidad>=10 (division entera: se descarta la
+				;               fraccion de centavo); 0 en otro caso.
+				; Entrada : EAX = importe base, EBX = cantidad.
+				; Salida  : EAX = descuento; CF=1 si desborda.
+				; Modifica: EAX, EFLAGS
+				; ============================================================================
+ 000005FA			CalcDiscount PROC USES ebx edx      ; EAX es resultado -> fuera de USES
+ 000005FA  53		   *	    push   ebx
+ 000005FB  52		   *	    push   edx
+ 000005FC  83 FB 0A		    cmp  ebx, DISC_MIN_QTY
+ 000005FF  72 14		    jb   cd_none
+ 00000601  BB 0000000A		    mov  ebx, DISC_PCT
+ 00000606  F7 E3		    mul  ebx                    ; EDX:EAX = base*10 ; CF=1 si desborda
+ 00000608  72 0D		    jc   cd_end
+ 0000060A  BB 00000064		    mov  ebx, 100
+ 0000060F  F7 F3		    div  ebx                    ; descuento entero (EDX=0 tras MUL sin acarreo)
+ 00000611  F8			    clc
+				    ret
+ 00000612  5A		   *	    pop    edx
+ 00000613  5B		   *	    pop    ebx
+ 00000614  C3		   *	    ret    00000h
+ 00000615			cd_none:
+ 00000615  33 C0		    xor  eax, eax               ; descuento 0 y CF=0
+ 00000617			cd_end:
+				    ret
+ 00000617  5A		   *	    pop    edx
+ 00000618  5B		   *	    pop    ebx
+ 00000619  C3		   *	    ret    00000h
+ 0000061A			CalcDiscount ENDP
+
+				; ============================================================================
+				; CalcSale : base = precio*cantidad; descuento; final = base - descuento.
+				; Entrada : ESI = registro del producto, EBX = cantidad.
+				; Salida  : ECX = base, EDI = descuento, EDX = final; CF=1 si desborda.
+				; Modifica: ECX, EDX, EDI, EFLAGS
+				; ============================================================================
+ 0000061A			CalcSale PROC USES eax              ; ECX, EDX, EDI son resultados
+ 0000061A  50		   *	    push   eax
+ 0000061B  8B 46 24		    mov  eax, [esi+OFF_PRICE]
+ 0000061E  F7 E3		    mul  ebx                    ; EDX:EAX = precio*cantidad
+ 00000620  72 10		    jc   cs_end
+ 00000622  8B C8		    mov  ecx, eax               ; ECX = importe base
+ 00000624  E8 FFFFFFD1		    call CalcDiscount           ; EAX = base -> EAX = descuento
+ 00000629  72 07		    jc   cs_end
+ 0000062B  8B F8		    mov  edi, eax               ; EDI = descuento
+ 0000062D  8B D1		    mov  edx, ecx
+ 0000062F  2B D7		    sub  edx, edi               ; EDX = importe final
+ 00000631  F8			    clc
+ 00000632			cs_end:
+				    ret
+ 00000632  58		   *	    pop    eax
+ 00000633  C3		   *	    ret    00000h
+ 00000634			CalcSale ENDP
+
+				; ============================================================================
+				; DoSell : venta de un solo producto con descuento por cantidad.
+				; Existencias e ingresos se modifican SOLO despues de pasar todas las pruebas.
+				; Modifica: EAX, EBX, ECX, EDX, ESI, EDI, EFLAGS
+				; ============================================================================
+ 00000634			DoSell PROC
+ 00000634  E8 FFFFFCC6		    call AskProduct
+ 00000639  0F 82 000000C7	    jc   sl_end
+ 0000063F  E8 FFFFFC6E		    call ShowRecord
+ 00000644  E8 FFFFFD0B		    call AskQuantity
+ 00000649  0F 82 000000B7	    jc   sl_end
+ 0000064F  8B D8		    mov  ebx, eax               ; EBX = cantidad
+ 00000651  3B 5E 28		    cmp  ebx, [esi+OFF_STOCK]
+ 00000654  0F 87 00000093	    ja   sl_nostock
+ 0000065A  E8 FFFFFFBB		    call CalcSale               ; ECX = base, EDI = descuento, EDX = final
+ 0000065F  0F 82 00000095	    jc   sl_ovf
+ 00000665  A1 000001C0 R	    mov  eax, revenue
+ 0000066A  03 C2		    add  eax, edx               ; nuevos ingresos
+ 0000066C  0F 82 00000088	    jc   sl_ovf
+				    ; ---- todo valido: se confirma la venta ----
+ 00000672  A3 000001C0 R	    mov  revenue, eax
+ 00000677  8B 46 28		    mov  eax, [esi+OFF_STOCK]
+ 0000067A  2B C3		    sub  eax, ebx
+ 0000067C  89 46 28		    mov  [esi+OFF_STOCK], eax
+ 0000067F  C6 05 000001C4 R	    mov  dirty, 1
+	   01
+				    ShowMXN msgBase, ecx
+ 00000686  52		     2	    push edx
+ 00000687  BA 00000880 R     2	    mov  edx, OFFSET msgBase
+ 0000068C  E8 00000000 E     2	    call WriteString
+ 00000691  5A		     2	    pop  edx
+ 00000692  8B C1	     1	    mov  eax, ecx
+ 00000694  E8 FFFFFAFA	     1	    call PrintMXN
+ 00000699  E8 00000000 E     1	    call Crlf
+ 0000069E  85 FF		    test edi, edi
+ 000006A0  74 1A		    jz   sl_nodisc
+				    ShowMXN msgDisc, edi
+ 000006A2  52		     2	    push edx
+ 000006A3  BA 00000890 R     2	    mov  edx, OFFSET msgDisc
+ 000006A8  E8 00000000 E     2	    call WriteString
+ 000006AD  5A		     2	    pop  edx
+ 000006AE  8B C7	     1	    mov  eax, edi
+ 000006B0  E8 FFFFFADE	     1	    call PrintMXN
+ 000006B5  E8 00000000 E     1	    call Crlf
+ 000006BA  EB 0C		    jmp  sl_final
+ 000006BC			sl_nodisc:
+				    Say  msgNoDisc
+ 000006BC  52		     1	    push edx
+ 000006BD  BA 000008B9 R     1	    mov  edx, OFFSET msgNoDisc
+ 000006C2  E8 00000000 E     1	    call WriteString
+ 000006C7  5A		     1	    pop  edx
+ 000006C8			sl_final:
+				    ShowMXN msgFinal, edx
+ 000006C8  52		     2	    push edx
+ 000006C9  BA 000008E1 R     2	    mov  edx, OFFSET msgFinal
+ 000006CE  E8 00000000 E     2	    call WriteString
+ 000006D3  5A		     2	    pop  edx
+ 000006D4  8B C2	     1	    mov  eax, edx
+ 000006D6  E8 FFFFFAB8	     1	    call PrintMXN
+ 000006DB  E8 00000000 E     1	    call Crlf
+				    Reject msgSaleOk
+ 000006E0  52		     2	    push edx
+ 000006E1  BA 000008F1 R     2	    mov  edx, OFFSET msgSaleOk
+ 000006E6  E8 00000000 E     2	    call WriteString
+ 000006EB  5A		     2	    pop  edx
+ 000006EC  C3		     1	    ret
+ 000006ED			sl_nostock:
+				    Reject msgNoStock
+ 000006ED  52		     2	    push edx
+ 000006EE  BA 00000821 R     2	    mov  edx, OFFSET msgNoStock
+ 000006F3  E8 00000000 E     2	    call WriteString
+ 000006F8  5A		     2	    pop  edx
+ 000006F9  C3		     1	    ret
+ 000006FA			sl_ovf:
+				    Say  msgOvf
+ 000006FA  52		     1	    push edx
+ 000006FB  BA 0000084F R     1	    mov  edx, OFFSET msgOvf
+ 00000700  E8 00000000 E     1	    call WriteString
+ 00000705  5A		     1	    pop  edx
+ 00000706			sl_end:
+ 00000706  C3			    ret
+ 00000707			DoSell ENDP
+
+				; ============================================================================
+				; DoSummary : unidades, valor del inventario e ingresos de la sesion.
+				; Modifica: EAX, EBX, ECX, EDX, ESI, EDI, EFLAGS
+				; ============================================================================
+ 00000707			DoSummary PROC
+ 00000707  33 DB		    xor  ebx, ebx               ; unidades
+ 00000709  33 FF		    xor  edi, edi               ; valor (centavos)
+ 0000070B  BE 00000008 R	    mov  esi, OFFSET products
+ 00000710  8B 0D 00000004 R	    mov  ecx, prodCount
+ 00000716  85 C9		    test ecx, ecx
+ 00000718  74 14		    jz   sm_print
+ 0000071A			sm_loop:
+ 0000071A  03 5E 28		    add  ebx, [esi+OFF_STOCK]
+ 0000071D  8B 46 24		    mov  eax, [esi+OFF_PRICE]
+ 00000720  F7 66 28		    mul  DWORD PTR [esi+OFF_STOCK]
+ 00000723  72 55		    jc   sm_ovf
+ 00000725  03 F8		    add  edi, eax
+ 00000727  72 51		    jc   sm_ovf
+ 00000729  83 C6 2C		    add  esi, REC_SIZE
+ 0000072C  E2 EC		    loop sm_loop
+ 0000072E			sm_print:
+				    ShowU32 msgSumUnits, ebx
+ 0000072E  52		     2	    push edx
+ 0000072F  BA 00000903 R     2	    mov  edx, OFFSET msgSumUnits
+ 00000734  E8 00000000 E     2	    call WriteString
+ 00000739  5A		     2	    pop  edx
+ 0000073A  8B C3	     2	    mov  eax, ebx
+ 0000073C  E8 FFFFFA39	     2	    call PrintU32
+ 00000741  E8 00000000 E     1	    call Crlf
+				    ShowMXN msgSumValue, edi
+ 00000746  52		     2	    push edx
+ 00000747  BA 0000091B R     2	    mov  edx, OFFSET msgSumValue
+ 0000074C  E8 00000000 E     2	    call WriteString
+ 00000751  5A		     2	    pop  edx
+ 00000752  8B C7	     1	    mov  eax, edi
+ 00000754  E8 FFFFFA3A	     1	    call PrintMXN
+ 00000759  E8 00000000 E     1	    call Crlf
+				    ShowMXN msgSumRev, revenue
+ 0000075E  52		     2	    push edx
+ 0000075F  BA 00000933 R     2	    mov  edx, OFFSET msgSumRev
+ 00000764  E8 00000000 E     2	    call WriteString
+ 00000769  5A		     2	    pop  edx
+ 0000076A  A1 000001C0 R     1	    mov  eax, revenue
+ 0000076F  E8 FFFFFA1F	     1	    call PrintMXN
+ 00000774  E8 00000000 E     1	    call Crlf
+ 00000779  C3			    ret
+ 0000077A			sm_ovf:
+				    Reject msgOvf
+ 0000077A  52		     2	    push edx
+ 0000077B  BA 0000084F R     2	    mov  edx, OFFSET msgOvf
+ 00000780  E8 00000000 E     2	    call WriteString
+ 00000785  5A		     2	    pop  edx
+ 00000786  C3		     1	    ret
+ 00000787			DoSummary ENDP
+
+				; ============================================================================
+				; SaveCatalog : escribe fileHdr+prodCount+registros (8 + n*44 bytes).
+				; Salida  : CF=1 si fallo (CreateOutputFile, WriteToFile o CloseFile).
+				; Modifica: EAX, ECX, EDX, EFLAGS
+				; ============================================================================
+ 00000787			SaveCatalog PROC
+ 00000787  BA 0000027F R	    mov  edx, OFFSET fileName
+ 0000078C  E8 00000000 E	    call CreateOutputFile       ; EAX = handle o INVALID_HANDLE_VALUE
+ 00000791  83 F8 FF		    cmp  eax, INVALID_HANDLE_VALUE
+ 00000794  74 58		    je   sv_err
+ 00000796  A3 0000028E R	    mov  hFile, eax
+				    FileBytes eax, prodCount
+ 0000079B  6B 05 00000004 R  1	    imul eax, prodCount, REC_SIZE
+	   2C
+ 000007A2  83 C0 08	     1	    add  eax, HDR_SIZE
+ 000007A5  A3 00000292 R	    mov  expected, eax          ; bytes que se deben escribir
+ 000007AA  A1 0000028E R	    mov  eax, hFile
+ 000007AF  BA 00000000 R	    mov  edx, OFFSET fileHdr
+ 000007B4  8B 0D 00000292 R	    mov  ecx, expected
+ 000007BA  E8 00000000 E	    call WriteToFile            ; EAX = bytes escritos
+ 000007BF  50			    push eax
+ 000007C0  A1 0000028E R	    mov  eax, hFile
+ 000007C5  E8 00000000 E	    call CloseFile              ; EAX<>0 si cierra bien
+ 000007CA  8B C8		    mov  ecx, eax
+ 000007CC  58			    pop  eax
+ 000007CD  3B 05 00000292 R	    cmp  eax, expected          ; se escribieron todos los bytes?
+ 000007D3  75 19		    jne  sv_err
+ 000007D5  85 C9		    test ecx, ecx
+ 000007D7  74 15		    jz   sv_err
+ 000007D9  C6 05 000001C4 R	    mov  dirty, 0
+	   00
+				    Say  msgSaved
+ 000007E0  52		     1	    push edx
+ 000007E1  BA 0000094B R     1	    mov  edx, OFFSET msgSaved
+ 000007E6  E8 00000000 E     1	    call WriteString
+ 000007EB  5A		     1	    pop  edx
+ 000007EC  F8			    clc
+ 000007ED  C3			    ret
+ 000007EE			sv_err:
+				    Fail msgSaveErr
+ 000007EE  52		     2	    push edx
+ 000007EF  BA 00000972 R     2	    mov  edx, OFFSET msgSaveErr
+ 000007F4  E8 00000000 E     2	    call WriteString
+ 000007F9  5A		     2	    pop  edx
+ 000007FA  F9		     1	    stc
+ 000007FB  C3		     1	    ret
+ 000007FC			SaveCatalog ENDP
+
+				; ============================================================================
+				; ReadInventoryFile : abre, lee a loadbuf y cierra inventario.dat.
+				; Valida: archivo existe, lectura sin error y 8 <= tamano <= 448.
+				; Salida  : CF=0 y bytesRead = tamano; CF=1 si fallo (mensaje ya mostrado).
+				; Modifica: EFLAGS (bytesRead, hFile y loadbuf son variables)
+				; ============================================================================
+ 000007FC			ReadInventoryFile PROC USES eax ecx edx edi
+ 000007FC  50		   *	    push   eax
+ 000007FD  51		   *	    push   ecx
+ 000007FE  52		   *	    push   edx
+ 000007FF  57		   *	    push   edi
+ 00000800  BA 0000027F R	    mov  edx, OFFSET fileName
+ 00000805  E8 00000000 E	    call OpenInputFile
+ 0000080A  83 F8 FF		    cmp  eax, INVALID_HANDLE_VALUE
+ 0000080D  74 56		    je   ri_nofile
+ 0000080F  A3 0000028E R	    mov  hFile, eax
+ 00000814  BF 0000029A R	    mov  edi, OFFSET loadbuf    ; limpia el buffer temporal
+ 00000819  B9 000001C2		    mov  ecx, FILE_CAP + 1
+ 0000081E  E8 FFFFF800		    call ZeroMem
+ 00000823  A1 0000028E R	    mov  eax, hFile
+ 00000828  BA 0000029A R	    mov  edx, OFFSET loadbuf
+ 0000082D  B9 000001C1		    mov  ecx, FILE_CAP          ; capacidad (no es lo mismo que bytes leidos)
+ 00000832  E8 00000000 E	    call ReadFromFile           ; CF=1 si error; EAX = bytes leidos
+ 00000837  9C			    pushfd
+ 00000838  A3 00000296 R	    mov  bytesRead, eax
+ 0000083D  A1 0000028E R	    mov  eax, hFile
+ 00000842  E8 00000000 E	    call CloseFile
+ 00000847  9D			    popfd
+ 00000848  72 2D		    jc   ri_readerr
+ 0000084A  83 3D 00000296 R	    cmp  bytesRead, HDR_SIZE
+	   08
+ 00000851  72 36		    jb   ri_invalid
+ 00000853  81 3D 00000296 R	    cmp  bytesRead, FILE_CAP    ; 449 => el archivo excede lo permitido
+	   000001C1
+ 0000085D  73 2A		    jae  ri_invalid
+ 0000085F  F8			    clc
+				    ret
+ 00000860  5F		   *	    pop    edi
+ 00000861  5A		   *	    pop    edx
+ 00000862  59		   *	    pop    ecx
+ 00000863  58		   *	    pop    eax
+ 00000864  C3		   *	    ret    00000h
+ 00000865			ri_nofile:
+				    Fail msgNoFile
+ 00000865  52		     2	    push edx
+ 00000866  BA 00000991 R     2	    mov  edx, OFFSET msgNoFile
+ 0000086B  E8 00000000 E     2	    call WriteString
+ 00000870  5A		     2	    pop  edx
+ 00000871  F9		     1	    stc
+ 00000872  5F		   *	    pop    edi
+ 00000873  5A		   *	    pop    edx
+ 00000874  59		   *	    pop    ecx
+ 00000875  58		   *	    pop    eax
+ 00000876  C3		   *	    ret    00000h
+ 00000877			ri_readerr:
+				    Fail msgReadErr
+ 00000877  52		     2	    push edx
+ 00000878  BA 000009DE R     2	    mov  edx, OFFSET msgReadErr
+ 0000087D  E8 00000000 E     2	    call WriteString
+ 00000882  5A		     2	    pop  edx
+ 00000883  F9		     1	    stc
+ 00000884  5F		   *	    pop    edi
+ 00000885  5A		   *	    pop    edx
+ 00000886  59		   *	    pop    ecx
+ 00000887  58		   *	    pop    eax
+ 00000888  C3		   *	    ret    00000h
+ 00000889			ri_invalid:
+				    Fail msgInvalid
+ 00000889  52		     2	    push edx
+ 0000088A  BA 00000A1A R     2	    mov  edx, OFFSET msgInvalid
+ 0000088F  E8 00000000 E     2	    call WriteString
+ 00000894  5A		     2	    pop  edx
+ 00000895  F9		     1	    stc
+ 00000896  5F		   *	    pop    edi
+ 00000897  5A		   *	    pop    edx
+ 00000898  59		   *	    pop    ecx
+ 00000899  58		   *	    pop    eax
+ 0000089A  C3		   *	    ret    00000h
+ 0000089B			ReadInventoryFile ENDP
+
+				; ============================================================================
+				; ValidateTable : valida cada registro leido en loadbuf+8.
+				; Entrada : EBX = numero de registros.
+				; Salida  : CF=1 si algun registro es invalido.
+				; Modifica: EFLAGS
+				; ============================================================================
+ 0000089B			ValidateTable PROC USES ecx esi
+ 0000089B  51		   *	    push   ecx
+ 0000089C  56		   *	    push   esi
+ 0000089D  8B CB		    mov  ecx, ebx
+ 0000089F  BE 000002A2 R	    mov  esi, OFFSET loadbuf + HDR_SIZE
+ 000008A4  85 C9		    test ecx, ecx
+ 000008A6  74 0C		    jz   vt_ok
+ 000008A8			vt_rec:
+ 000008A8  E8 FFFFF994		    call ValidateRecord
+ 000008AD  72 09		    jc   vt_bad
+ 000008AF  83 C6 2C		    add  esi, REC_SIZE
+ 000008B2  E2 F4		    loop vt_rec
+ 000008B4			vt_ok:
+ 000008B4  F8			    clc
+				    ret
+ 000008B5  5E		   *	    pop    esi
+ 000008B6  59		   *	    pop    ecx
+ 000008B7  C3		   *	    ret    00000h
+ 000008B8			vt_bad:
+ 000008B8  F9			    stc
+				    ret
+ 000008B9  5E		   *	    pop    esi
+ 000008BA  59		   *	    pop    ecx
+ 000008BB  C3		   *	    ret    00000h
+ 000008BC			ValidateTable ENDP
+
+				; ============================================================================
+				; HasDuplicates : busca codigos repetidos en loadbuf+8 (pares i<j).
+				; Entrada : EBX = numero de registros.
+				; Salida  : CF=1 si hay codigos repetidos.
+				; Modifica: EFLAGS
+				; ============================================================================
+ 000008BC			HasDuplicates PROC USES ecx edx esi edi
+ 000008BC  51		   *	    push   ecx
+ 000008BD  52		   *	    push   edx
+ 000008BE  56		   *	    push   esi
+ 000008BF  57		   *	    push   edi
+ 000008C0  BE 000002A2 R	    mov  esi, OFFSET loadbuf + HDR_SIZE
+ 000008C5  8B CB		    mov  ecx, ebx
+ 000008C7			hd_out:
+ 000008C7  83 F9 01		    cmp  ecx, 1
+ 000008CA  76 1B		    jbe  hd_none
+ 000008CC  8B FE		    mov  edi, esi
+ 000008CE  83 C7 2C		    add  edi, REC_SIZE
+ 000008D1  8B D1		    mov  edx, ecx
+ 000008D3  4A			    dec  edx
+ 000008D4			hd_in:
+ 000008D4  E8 FFFFF99C		    call CodesEqual
+ 000008D9  74 12		    je   hd_dup
+ 000008DB  83 C7 2C		    add  edi, REC_SIZE
+ 000008DE  4A			    dec  edx
+ 000008DF  75 F3		    jnz  hd_in
+ 000008E1  83 C6 2C		    add  esi, REC_SIZE
+ 000008E4  49			    dec  ecx
+ 000008E5  EB E0		    jmp  hd_out
+ 000008E7			hd_none:
+ 000008E7  F8			    clc
+				    ret
+ 000008E8  5F		   *	    pop    edi
+ 000008E9  5E		   *	    pop    esi
+ 000008EA  5A		   *	    pop    edx
+ 000008EB  59		   *	    pop    ecx
+ 000008EC  C3		   *	    ret    00000h
+ 000008ED			hd_dup:
+ 000008ED  F9			    stc
+				    ret
+ 000008EE  5F		   *	    pop    edi
+ 000008EF  5E		   *	    pop    esi
+ 000008F0  5A		   *	    pop    edx
+ 000008F1  59		   *	    pop    ecx
+ 000008F2  C3		   *	    ret    00000h
+ 000008F3			HasDuplicates ENDP
+
+				; ============================================================================
+				; LoadCatalog : lee inventario.dat, VALIDA todo y solo entonces reemplaza el
+				;               catalogo. Si algo falla, no cambia nada.
+				; Validaciones: archivo existe, lectura sin error, tamano>=8 y <=448,
+				;   firma "INV1", conteo<=10, tamano == 8+conteo*44, cada registro valido,
+				;   sin codigos duplicados.
+				; Salida  : CF=1 si fallo.
+				; Modifica: EAX, EBX, ECX, EDX, ESI, EDI, EFLAGS
+				; ============================================================================
+ 000008F3			LoadCatalog PROC
+ 000008F3  E8 FFFFFF04		    call ReadInventoryFile
+ 000008F8  72 5A		    jc   ld_end                 ; mensaje ya mostrado
+ 000008FA  81 3D 0000029A R	    cmp  DWORD PTR [loadbuf], MAGIC_INV1
+	   31564E49
+ 00000904  75 4F		    jne  ld_invalid
+ 00000906  A1 0000029E R	    mov  eax, DWORD PTR [loadbuf+4]
+ 0000090B  83 F8 0A		    cmp  eax, PROD_MAX
+ 0000090E  77 45		    ja   ld_invalid
+				    FileBytes edx, eax
+ 00000910  6B D0 2C	     1	    imul edx, eax, REC_SIZE
+ 00000913  83 C2 08	     1	    add  edx, HDR_SIZE
+ 00000916  3B 15 00000296 R	    cmp  edx, bytesRead         ; tamano exacto esperado
+ 0000091C  75 37		    jne  ld_invalid
+ 0000091E  8B D8		    mov  ebx, eax               ; EBX = conteo
+ 00000920  E8 FFFFFF76		    call ValidateTable
+ 00000925  72 2E		    jc   ld_invalid
+ 00000927  E8 FFFFFF90		    call HasDuplicates
+ 0000092C  72 27		    jc   ld_invalid
+ 0000092E  FC			    cld
+ 0000092F  BE 0000029E R	    mov  esi, OFFSET loadbuf + 4    ; conteo + registros
+ 00000934  BF 00000004 R	    mov  edi, OFFSET prodCount
+ 00000939  B9 000001BC		    mov  ecx, 4 + PROD_MAX*REC_SIZE
+ 0000093E  F3/ A4		    rep  movsb
+ 00000940  C6 05 000001C4 R	    mov  dirty, 0
+	   00
+				    Say  msgLoaded
+ 00000947  52		     1	    push edx
+ 00000948  BA 00000A5F R     1	    mov  edx, OFFSET msgLoaded
+ 0000094D  E8 00000000 E     1	    call WriteString
+ 00000952  5A		     1	    pop  edx
+ 00000953  F8			    clc
+ 00000954			ld_end:
+ 00000954  C3			    ret
+ 00000955			ld_invalid:
+				    Fail msgInvalid
+ 00000955  52		     2	    push edx
+ 00000956  BA 00000A1A R     2	    mov  edx, OFFSET msgInvalid
+ 0000095B  E8 00000000 E     2	    call WriteString
+ 00000960  5A		     2	    pop  edx
+ 00000961  F9		     1	    stc
+ 00000962  C3		     1	    ret
+ 00000963			LoadCatalog ENDP
+
+				; ============================================================================
+				; DoLoad : opcion 8 del menu: confirma si hay cambios y carga el catalogo.
+				; Modifica: EAX, EBX, ECX, EDX, ESI, EDI, EFLAGS
+				; ============================================================================
+ 00000963			DoLoad PROC
+ 00000963  E8 FFFFFA4D		    call ConfirmDiscard
+ 00000968  72 05		    jc   dl_end
+ 0000096A  E8 FFFFFF84		    call LoadCatalog
+ 0000096F			dl_end:
+ 0000096F  C3			    ret
+ 00000970			DoLoad ENDP
+
+				; ============================================================================
+				; main : menu repetitivo. Antes de cada vuelta compara ESP con el valor
+				;        inicial para comprobar que la pila quedo equilibrada.
+				;        Las opciones 1..8 se despachan con la macro MenuItem.
+				; ============================================================================
+ 00000970			main PROC
+ 00000970  89 25 000001C5 R	    mov  mainEsp, esp
+				    Say  msgBanner
+ 00000976  52		     1	    push edx
+ 00000977  BA 0000045C R     1	    mov  edx, OFFSET msgBanner
+ 0000097C  E8 00000000 E     1	    call WriteString
+ 00000981  5A		     1	    pop  edx
+ 00000982  E8 FFFFFF6C		    call LoadCatalog            ; intenta recuperar el catalogo al iniciar
+ 00000987			menu_loop:
+ 00000987  3B 25 000001C5 R	    cmp  esp, mainEsp
+ 0000098D  0F 85 0000009F	    jne  stack_err
+				    Say  msgMenu
+ 00000993  52		     1	    push edx
+ 00000994  BA 00000488 R     1	    mov  edx, OFFSET msgMenu
+ 00000999  E8 00000000 E     1	    call WriteString
+ 0000099E  5A		     1	    pop  edx
+ 0000099F  E8 FFFFF68B		    call ReadLine
+ 000009A4  72 7B		    jc   bad_opt
+ 000009A6  83 F8 01		    cmp  eax, 1
+ 000009A9  75 76		    jne  bad_opt
+ 000009AB  A0 000001C9 R	    mov  al, [inbuf]
+				    MenuItem '1', DoRegister
+ 000009B0  3C 31	     1	    cmp  al, '1'
+ 000009B2  75 07	     1	    jne  ??0000
+ 000009B4  E8 FFFFFA19	     1	    call DoRegister
+ 000009B9  EB CC	     1	    jmp  menu_loop
+ 000009BB		     1	??0000:
+				    MenuItem '2', DoShowAll
+ 000009BB  3C 32	     1	    cmp  al, '2'
+ 000009BD  75 07	     1	    jne  ??0001
+ 000009BF  E8 FFFFFBAB	     1	    call DoShowAll
+ 000009C4  EB C1	     1	    jmp  menu_loop
+ 000009C6		     1	??0001:
+				    MenuItem '3', DoSearch
+ 000009C6  3C 33	     1	    cmp  al, '3'
+ 000009C8  75 07	     1	    jne  ??0002
+ 000009CA  E8 FFFFFBC7	     1	    call DoSearch
+ 000009CF  EB B6	     1	    jmp  menu_loop
+ 000009D1		     1	??0002:
+				    MenuItem '4', DoReceive
+ 000009D1  3C 34	     1	    cmp  al, '4'
+ 000009D3  75 07	     1	    jne  ??0003
+ 000009D5  E8 FFFFFBC9	     1	    call DoReceive
+ 000009DA  EB AB	     1	    jmp  menu_loop
+ 000009DC		     1	??0003:
+				    MenuItem '5', DoSell
+ 000009DC  3C 35	     1	    cmp  al, '5'
+ 000009DE  75 07	     1	    jne  ??0004
+ 000009E0  E8 FFFFFC4F	     1	    call DoSell
+ 000009E5  EB A0	     1	    jmp  menu_loop
+ 000009E7		     1	??0004:
+				    MenuItem '6', DoSummary
+ 000009E7  3C 36	     1	    cmp  al, '6'
+ 000009E9  75 07	     1	    jne  ??0005
+ 000009EB  E8 FFFFFD17	     1	    call DoSummary
+ 000009F0  EB 95	     1	    jmp  menu_loop
+ 000009F2		     1	??0005:
+				    MenuItem '7', SaveCatalog
+ 000009F2  3C 37	     1	    cmp  al, '7'
+ 000009F4  75 07	     1	    jne  ??0006
+ 000009F6  E8 FFFFFD8C	     1	    call SaveCatalog
+ 000009FB  EB 8A	     1	    jmp  menu_loop
+ 000009FD		     1	??0006:
+				    MenuItem '8', DoLoad
+ 000009FD  3C 38	     1	    cmp  al, '8'
+ 000009FF  75 0A	     1	    jne  ??0007
+ 00000A01  E8 FFFFFF5D	     1	    call DoLoad
+ 00000A06  E9 FFFFFF7C	     1	    jmp  menu_loop
+ 00000A0B		     1	??0007:
+ 00000A0B  3C 39		    cmp  al, '9'
+ 00000A0D  75 12		    jne  bad_opt
+ 00000A0F  E8 FFFFF9A1		    call ConfirmDiscard         ; opcion 9: salir (pregunta si hay cambios)
+ 00000A14  0F 82 FFFFFF6D	    jc   menu_loop
+				    exit
+ 00000A1A  6A 00	   *	    push   +000000000h
+ 00000A1C  E8 00000000 E   *	    call   ExitProcess
+ 00000A21			bad_opt:
+				    Say  msgBadOpt
+ 00000A21  52		     1	    push edx
+ 00000A22  BA 0000054C R     1	    mov  edx, OFFSET msgBadOpt
+ 00000A27  E8 00000000 E     1	    call WriteString
+ 00000A2C  5A		     1	    pop  edx
+ 00000A2D  E9 FFFFFF55		    jmp  menu_loop
+ 00000A32			stack_err:
+				    Say  msgStackErr
+ 00000A32  52		     1	    push edx
+ 00000A33  BA 00000ABC R     1	    mov  edx, OFFSET msgStackErr
+ 00000A38  E8 00000000 E     1	    call WriteString
+ 00000A3D  5A		     1	    pop  edx
+				    exit
+ 00000A3E  6A 00	   *	    push   +000000000h
+ 00000A40  E8 00000000 E   *	    call   ExitProcess
+ 00000A45			main ENDP
+				END main
+Microsoft (R) Macro Assembler Version 14.44.35229.0	    11/16/26 21:59:13
+AddTwo.asm						     Symbols 2 - 1
+
+
+
+
+Macros:
+
+                N a m e                 Type
+
+AskCheck . . . . . . . . . . . .	Proc
+Ask  . . . . . . . . . . . . . .	Proc
+CopyField  . . . . . . . . . . .	Proc
+Fail . . . . . . . . . . . . . .	Proc
+FileBytes  . . . . . . . . . . .	Proc
+JNotDigit  . . . . . . . . . . .	Proc
+JNotRange  . . . . . . . . . . .	Proc
+MenuItem . . . . . . . . . . . .	Proc
+ParseBetween . . . . . . . . . .	Proc
+Put  . . . . . . . . . . . . . .	Proc
+RecAddr  . . . . . . . . . . . .	Proc
+Reject . . . . . . . . . . . . .	Proc
+Say  . . . . . . . . . . . . . .	Proc
+ShowMXN  . . . . . . . . . . . .	Proc
+ShowU32  . . . . . . . . . . . .	Proc
+
+
+Structures and Unions:
+
+                N a m e                  Size
+                                         Offset      Type
+
+CONSOLE_CURSOR_INFO  . . . . . .	 00000008
+  dwSize . . . . . . . . . . . .	 00000000	 DWord
+  bVisible . . . . . . . . . . .	 00000004	 DWord
+CONSOLE_SCREEN_BUFFER_INFO . . .	 00000016
+  dwSize . . . . . . . . . . . .	 00000000	 DWord
+  dwCursorPosition . . . . . . .	 00000004	 DWord
+  wAttributes  . . . . . . . . .	 00000008	 Word
+  srWindow . . . . . . . . . . .	 0000000A	 QWord
+  dwMaximumWindowSize  . . . . .	 00000012	 DWord
+COORD  . . . . . . . . . . . . .	 00000004
+  X  . . . . . . . . . . . . . .	 00000000	 Word
+  Y  . . . . . . . . . . . . . .	 00000002	 Word
+FILETIME . . . . . . . . . . . .	 00000008
+  loDateTime . . . . . . . . . .	 00000000	 DWord
+  hiDateTime . . . . . . . . . .	 00000004	 DWord
+FOCUS_EVENT_RECORD . . . . . . .	 00000004
+  bSetFocus  . . . . . . . . . .	 00000000	 DWord
+FPU_ENVIRON  . . . . . . . . . .	 0000001C
+  controlWord  . . . . . . . . .	 00000000	 Word
+  statusWord . . . . . . . . . .	 00000004	 Word
+  tagWord  . . . . . . . . . . .	 00000008	 Word
+  instrPointerOffset . . . . . .	 0000000C	 DWord
+  instrPointerSelector . . . . .	 00000010	 DWord
+  operandPointerOffset . . . . .	 00000014	 DWord
+  operandPointerSelector . . . .	 00000018	 Word
+INPUT_RECORD . . . . . . . . . .	 00000014
+  EventType  . . . . . . . . . .	 00000000	 Word
+  Event  . . . . . . . . . . . .	 00000004	 XmmWord
+  bKeyDown . . . . . . . . . . .	 00000000	 DWord
+  wRepeatCount . . . . . . . . .	 00000004	 Word
+  wVirtualKeyCode  . . . . . . .	 00000006	 Word
+  wVirtualScanCode . . . . . . .	 00000008	 Word
+  uChar  . . . . . . . . . . . .	 0000000A	 Word
+  UnicodeChar  . . . . . . . . .	 00000000	 Word
+  AsciiChar  . . . . . . . . . .	 00000000	 Byte
+  dwControlKeyState  . . . . . .	 0000000C	 DWord
+  dwMousePosition  . . . . . . .	 00000000	 DWord
+  dwButtonState  . . . . . . . .	 00000004	 DWord
+  dwMouseControlKeyState . . . .	 00000008	 DWord
+  dwEventFlags . . . . . . . . .	 0000000C	 DWord
+  dwSize . . . . . . . . . . . .	 00000000	 DWord
+  dwCommandId  . . . . . . . . .	 00000000	 DWord
+  bSetFocus  . . . . . . . . . .	 00000000	 DWord
+KEY_EVENT_RECORD . . . . . . . .	 00000010
+  bKeyDown . . . . . . . . . . .	 00000000	 DWord
+  wRepeatCount . . . . . . . . .	 00000004	 Word
+  wVirtualKeyCode  . . . . . . .	 00000006	 Word
+  wVirtualScanCode . . . . . . .	 00000008	 Word
+  uChar  . . . . . . . . . . . .	 0000000A	 Word
+  UnicodeChar  . . . . . . . . .	 00000000	 Word
+  AsciiChar  . . . . . . . . . .	 00000000	 Byte
+  dwControlKeyState  . . . . . .	 0000000C	 DWord
+MENU_EVENT_RECORD  . . . . . . .	 00000004
+  dwCommandId  . . . . . . . . .	 00000000	 DWord
+MOUSE_EVENT_RECORD . . . . . . .	 00000010
+  dwMousePosition  . . . . . . .	 00000000	 DWord
+  dwButtonState  . . . . . . . .	 00000004	 DWord
+  dwMouseControlKeyState . . . .	 00000008	 DWord
+  dwEventFlags . . . . . . . . .	 0000000C	 DWord
+SMALL_RECT . . . . . . . . . . .	 00000008
+  Left . . . . . . . . . . . . .	 00000000	 Word
+  Top  . . . . . . . . . . . . .	 00000002	 Word
+  Right  . . . . . . . . . . . .	 00000004	 Word
+  Bottom . . . . . . . . . . . .	 00000006	 Word
+SYSTEMTIME . . . . . . . . . . .	 00000010
+  wYear  . . . . . . . . . . . .	 00000000	 Word
+  wMonth . . . . . . . . . . . .	 00000002	 Word
+  wDayOfWeek . . . . . . . . . .	 00000004	 Word
+  wDay . . . . . . . . . . . . .	 00000006	 Word
+  wHour  . . . . . . . . . . . .	 00000008	 Word
+  wMinute  . . . . . . . . . . .	 0000000A	 Word
+  wSecond  . . . . . . . . . . .	 0000000C	 Word
+  wMilliseconds  . . . . . . . .	 0000000E	 Word
+WINDOW_BUFFER_SIZE_RECORD  . . .	 00000004
+  dwSize . . . . . . . . . . . .	 00000000	 DWord
+
+
+Segments and Groups:
+
+                N a m e                 Size     Length   Align   Combine Class
+
+FLAT . . . . . . . . . . . . . .	GROUP
+STACK  . . . . . . . . . . . . .	32 Bit	 00001000 Para	  Stack	  'STACK'	 
+_DATA  . . . . . . . . . . . . .	32 Bit	 00000AF8 Para	  Public  'DATA'	
+_TEXT  . . . . . . . . . . . . .	32 Bit	 00000A45 Para	  Public  'CODE'	
+
+
+Procedures, parameters, and locals:
+
+                N a m e                 Type     Value    Attr
+
+AskProduct . . . . . . . . . . .	P Near	 000002FF _TEXT	Length= 00000055 Public STDCALL
+  ap_badfmt  . . . . . . . . . .	L Near	 00000330 _TEXT	
+  ap_nf  . . . . . . . . . . . .	L Near	 00000340 _TEXT	
+  ap_err . . . . . . . . . . . .	L Near	 00000350 _TEXT	
+AskQuantity  . . . . . . . . . .	P Near	 00000354 _TEXT	Length= 00000046 Public STDCALL
+  aq_inv . . . . . . . . . . . .	L Near	 00000384 _TEXT	
+  aq_err . . . . . . . . . . . .	L Near	 00000395 _TEXT	
+CalcDiscount . . . . . . . . . .	P Near	 000005FA _TEXT	Length= 00000020 Public STDCALL
+  cd_none  . . . . . . . . . . .	L Near	 00000615 _TEXT	
+  cd_end . . . . . . . . . . . .	L Near	 00000617 _TEXT	
+CalcSale . . . . . . . . . . . .	P Near	 0000061A _TEXT	Length= 0000001A Public STDCALL
+  cs_end . . . . . . . . . . . .	L Near	 00000632 _TEXT	
+CloseFile  . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+CloseHandle  . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+Clrscr . . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+CodesEqual . . . . . . . . . . .	P Near	 00000275 _TEXT	Length= 0000001A Public STDCALL
+  ce_loop  . . . . . . . . . . .	L Near	 0000027E _TEXT	
+  ce_done  . . . . . . . . . . .	L Near	 0000028A _TEXT	
+ConfirmDiscard . . . . . . . . .	P Near	 000003B5 _TEXT	Length= 0000001D Public STDCALL
+  cf_ok  . . . . . . . . . . . .	L Near	 000003D0 _TEXT	
+ConfirmYN  . . . . . . . . . . .	P Near	 0000039A _TEXT	Length= 0000001B Public STDCALL
+  cy_no  . . . . . . . . . . . .	L Near	 000003B3 _TEXT	
+CopyPad  . . . . . . . . . . . .	P Near	 00000000 _TEXT	Length= 00000023 Public STDCALL
+  cp_loop  . . . . . . . . . . .	L Near	 00000005 _TEXT	
+  cp_fin . . . . . . . . . . . .	L Near	 00000016 _TEXT	
+  cp_zero  . . . . . . . . . . .	L Near	 00000017 _TEXT	
+CreateFileA  . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+CreateOutputFile . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+Crlf . . . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+Delay  . . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+DoLoad . . . . . . . . . . . . .	P Near	 00000963 _TEXT	Length= 0000000D Public STDCALL
+  dl_end . . . . . . . . . . . .	L Near	 0000096F _TEXT	
+DoReceive  . . . . . . . . . . .	P Near	 000005A3 _TEXT	Length= 00000057 Public STDCALL
+  rv_ovf . . . . . . . . . . . .	L Near	 000005E0 _TEXT	
+  rv_excess  . . . . . . . . . .	L Near	 000005ED _TEXT	
+  rv_end . . . . . . . . . . . .	L Near	 000005F9 _TEXT	
+DoRegister . . . . . . . . . . .	P Near	 000003D2 _TEXT	Length= 0000019D Public STDCALL
+  dr_space . . . . . . . . . . .	L Near	 000003E8 _TEXT	
+  dr_badcode . . . . . . . . . .	L Near	 0000052E _TEXT	
+  dr_dup . . . . . . . . . . . .	L Near	 0000053B _TEXT	
+  dr_badname . . . . . . . . . .	L Near	 00000548 _TEXT	
+  dr_badprice  . . . . . . . . .	L Near	 00000555 _TEXT	
+  dr_badstock  . . . . . . . . .	L Near	 00000562 _TEXT	
+  dr_end . . . . . . . . . . . .	L Near	 0000056E _TEXT	
+DoSearch . . . . . . . . . . . .	P Near	 00000596 _TEXT	Length= 0000000D Public STDCALL
+  ds_end . . . . . . . . . . . .	L Near	 000005A2 _TEXT	
+DoSell . . . . . . . . . . . . .	P Near	 00000634 _TEXT	Length= 000000D3 Public STDCALL
+  sl_nodisc  . . . . . . . . . .	L Near	 000006BC _TEXT	
+  sl_final . . . . . . . . . . .	L Near	 000006C8 _TEXT	
+  sl_nostock . . . . . . . . . .	L Near	 000006ED _TEXT	
+  sl_ovf . . . . . . . . . . . .	L Near	 000006FA _TEXT	
+  sl_end . . . . . . . . . . . .	L Near	 00000706 _TEXT	
+DoShowAll  . . . . . . . . . . .	P Near	 0000056F _TEXT	Length= 00000027 Public STDCALL
+  sa_go  . . . . . . . . . . . .	L Near	 00000586 _TEXT	
+  sa_loop  . . . . . . . . . . .	L Near	 0000058B _TEXT	
+DoSummary  . . . . . . . . . . .	P Near	 00000707 _TEXT	Length= 00000080 Public STDCALL
+  sm_loop  . . . . . . . . . . .	L Near	 0000071A _TEXT	
+  sm_print . . . . . . . . . . .	L Near	 0000072E _TEXT	
+  sm_ovf . . . . . . . . . . . .	L Near	 0000077A _TEXT	
+DumpMem  . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+DumpRegs . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+ExitProcess  . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+FileTimeToDosDateTime  . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+FileTimeToSystemTime . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+FindProduct  . . . . . . . . . .	P Near	 0000028F _TEXT	Length= 00000023 Public STDCALL
+  fp_loop  . . . . . . . . . . .	L Near	 0000029F _TEXT	
+  fp_nf  . . . . . . . . . . . .	L Near	 000002AC _TEXT	
+  fp_found . . . . . . . . . . .	L Near	 000002AF _TEXT	
+FlushConsoleInputBuffer  . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+FormatMessageA . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+GetCommandLineA  . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+GetCommandTail . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+GetConsoleCP . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+GetConsoleCursorInfo . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+GetConsoleMode . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+GetConsoleScreenBufferInfo . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+GetDateTime  . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+GetFileTime  . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+GetInput . . . . . . . . . . . .	P Near	 00000065 _TEXT	Length= 0000001B Public STDCALL
+  gi_bad . . . . . . . . . . . .	L Near	 00000070 _TEXT	
+  gi_ok  . . . . . . . . . . . .	L Near	 0000007E _TEXT	
+GetKeyState  . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+GetLastError . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+GetLocalTime . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+GetMaxXY . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+GetMseconds  . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+GetNumberOfConsoleInputEvents  .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+GetProcessHeap . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+GetStdHandle . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+GetSystemTime  . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+GetTextColor . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+GetTickCount . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+Gotoxy . . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+HasDuplicates  . . . . . . . . .	P Near	 000008BC _TEXT	Length= 00000037 Public STDCALL
+  hd_out . . . . . . . . . . . .	L Near	 000008C7 _TEXT	
+  hd_in  . . . . . . . . . . . .	L Near	 000008D4 _TEXT	
+  hd_none  . . . . . . . . . . .	L Near	 000008E7 _TEXT	
+  hd_dup . . . . . . . . . . . .	L Near	 000008ED _TEXT	
+HeapAlloc  . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+HeapCreate . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+HeapDestroy  . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+HeapFree . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+HeapSize . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+IsDigit  . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+LoadCatalog  . . . . . . . . . .	P Near	 000008F3 _TEXT	Length= 00000070 Public STDCALL
+  ld_end . . . . . . . . . . . .	L Near	 00000954 _TEXT	
+  ld_invalid . . . . . . . . . .	L Near	 00000955 _TEXT	
+LocalFree  . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+MessageBoxA  . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+MsgBoxAsk  . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+MsgBox . . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+OpenInputFile  . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+ParseDecimal32 . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+ParseInteger32 . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+ParsePrice . . . . . . . . . . .	P Near	 000000CD _TEXT	Length= 00000089 Public STDCALL
+  pp_int . . . . . . . . . . . .	L Near	 000000D5 _TEXT	
+  pp_intEnd  . . . . . . . . . .	L Near	 000000FE _TEXT	
+  pp_range . . . . . . . . . . .	L Near	 0000013E _TEXT	
+  pp_bad . . . . . . . . . . . .	L Near	 00000150 _TEXT	
+  pp_done  . . . . . . . . . . .	L Near	 00000151 _TEXT	
+ParseRange . . . . . . . . . . .	P Near	 000000BA _TEXT	Length= 00000013 Public STDCALL
+  pr_bad . . . . . . . . . . . .	L Near	 000000CB _TEXT	
+  pr_end . . . . . . . . . . . .	L Near	 000000CC _TEXT	
+ParseUInt  . . . . . . . . . . .	P Near	 00000080 _TEXT	Length= 0000003A Public STDCALL
+  pu_loop  . . . . . . . . . . .	L Near	 00000088 _TEXT	
+  pu_end . . . . . . . . . . . .	L Near	 000000AD _TEXT	
+  pu_bad . . . . . . . . . . . .	L Near	 000000B4 _TEXT	
+  pu_done  . . . . . . . . . . .	L Near	 000000B5 _TEXT	
+PeekConsoleInputA  . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+PrintMXN . . . . . . . . . . . .	P Near	 00000193 _TEXT	Length= 0000004B Public STDCALL
+  pm_two . . . . . . . . . . . .	L Near	 000001CA _TEXT	
+PrintU32 . . . . . . . . . . . .	P Near	 0000017A _TEXT	Length= 0000000D Public STDCALL
+Random32 . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+RandomRange  . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+Randomize  . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+ReadChar . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+ReadConsoleA . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+ReadConsoleInputA  . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+ReadDec  . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+ReadFile . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+ReadFloat  . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+ReadFromFile . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+ReadHex  . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+ReadInt  . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+ReadInventoryFile  . . . . . . .	P Near	 000007FC _TEXT	Length= 0000009F Public STDCALL
+  ri_nofile  . . . . . . . . . .	L Near	 00000865 _TEXT	
+  ri_readerr . . . . . . . . . .	L Near	 00000877 _TEXT	
+  ri_invalid . . . . . . . . . .	L Near	 00000889 _TEXT	
+ReadKeyFlush . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+ReadKey  . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+ReadLine . . . . . . . . . . . .	P Near	 0000002F _TEXT	Length= 00000036 Public STDCALL
+  rl_drain . . . . . . . . . . .	L Near	 00000045 _TEXT	
+  rl_ok  . . . . . . . . . . . .	L Near	 00000061 _TEXT	
+  rl_done  . . . . . . . . . . .	L Near	 00000062 _TEXT	
+ReadString . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+SaveCatalog  . . . . . . . . . .	P Near	 00000787 _TEXT	Length= 00000075 Public STDCALL
+  sv_err . . . . . . . . . . . .	L Near	 000007EE _TEXT	
+SetConsoleCursorInfo . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+SetConsoleCursorPosition . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+SetConsoleMode . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+SetConsoleScreenBufferSize . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+SetConsoleTextAttribute  . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+SetConsoleTitleA . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+SetConsoleWindowInfo . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+SetFilePointer . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+SetLocalTime . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+SetTextColor . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+ShowFPUStack . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+ShowRecord . . . . . . . . . . .	P Near	 000002B2 _TEXT	Length= 0000004D Public STDCALL
+Sleep  . . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+SplitMXN . . . . . . . . . . . .	P Near	 00000187 _TEXT	Length= 0000000C Public STDCALL
+StrLength  . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+Str_compare  . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+Str_copy . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+Str_length . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+Str_trim . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+Str_ucase  . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+SystemTimeToFileTime . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+ToDecStr . . . . . . . . . . . .	P Near	 00000156 _TEXT	Length= 00000024 Public STDCALL
+  ts_loop  . . . . . . . . . . .	L Near	 00000166 _TEXT	
+ValidateCode . . . . . . . . . .	P Near	 000001DE _TEXT	Length= 0000003B Public STDCALL
+  vc_l1  . . . . . . . . . . . .	L Near	 000001E6 _TEXT	
+  vc_l2  . . . . . . . . . . . .	L Near	 000001FF _TEXT	
+  vc_bad . . . . . . . . . . . .	L Near	 00000214 _TEXT	
+  vc_done  . . . . . . . . . . .	L Near	 00000215 _TEXT	
+ValidateName . . . . . . . . . .	P Near	 00000219 _TEXT	Length= 00000028 Public STDCALL
+  vn_loop  . . . . . . . . . . .	L Near	 0000021E _TEXT	
+  vn_end . . . . . . . . . . . .	L Near	 00000235 _TEXT	
+  vn_bad . . . . . . . . . . . .	L Near	 0000023C _TEXT	
+  vn_done  . . . . . . . . . . .	L Near	 0000023D _TEXT	
+ValidateRecord . . . . . . . . .	P Near	 00000241 _TEXT	Length= 00000034 Public STDCALL
+  vr_bad . . . . . . . . . . . .	L Near	 00000271 _TEXT	
+  vr_done  . . . . . . . . . . .	L Near	 00000272 _TEXT	
+ValidateTable  . . . . . . . . .	P Near	 0000089B _TEXT	Length= 00000021 Public STDCALL
+  vt_rec . . . . . . . . . . . .	L Near	 000008A8 _TEXT	
+  vt_ok  . . . . . . . . . . . .	L Near	 000008B4 _TEXT	
+  vt_bad . . . . . . . . . . . .	L Near	 000008B8 _TEXT	
+WaitMsg  . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+WriteBinB  . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+WriteBin . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+WriteChar  . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+WriteConsoleA  . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+WriteConsoleOutputAttribute  . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+WriteConsoleOutputCharacterA . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+WriteDec . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+WriteFile  . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+WriteFloat . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+WriteHexB  . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+WriteHex . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+WriteInt . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+WriteStackFrameName  . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+WriteStackFrame  . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+WriteString  . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+WriteToFile  . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+WriteWindowsMsg  . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External STDCALL
+ZeroMem  . . . . . . . . . . . .	P Near	 00000023 _TEXT	Length= 0000000C Public STDCALL
+main . . . . . . . . . . . . . .	P Near	 00000970 _TEXT	Length= 000000D5 Public STDCALL
+  menu_loop  . . . . . . . . . .	L Near	 00000987 _TEXT	
+  ??0000 . . . . . . . . . . . .	L Near	 000009BB _TEXT	
+  ??0001 . . . . . . . . . . . .	L Near	 000009C6 _TEXT	
+  ??0002 . . . . . . . . . . . .	L Near	 000009D1 _TEXT	
+  ??0003 . . . . . . . . . . . .	L Near	 000009DC _TEXT	
+  ??0004 . . . . . . . . . . . .	L Near	 000009E7 _TEXT	
+  ??0005 . . . . . . . . . . . .	L Near	 000009F2 _TEXT	
+  ??0006 . . . . . . . . . . . .	L Near	 000009FD _TEXT	
+  ??0007 . . . . . . . . . . . .	L Near	 00000A0B _TEXT	
+  bad_opt  . . . . . . . . . . .	L Near	 00000A21 _TEXT	
+  stack_err  . . . . . . . . . .	L Near	 00000A32 _TEXT	
+printf . . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External C
+scanf  . . . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External C
+wsprintfA  . . . . . . . . . . .	P Near	 00000000 FLAT	Length= 00000000 External C
+
+
+Symbols:
+
+                N a m e                 Type     Value    Attr
+
+@CodeSize  . . . . . . . . . . .	Number	 00000000h   
+@DataSize  . . . . . . . . . . .	Number	 00000000h   
+@Interface . . . . . . . . . . .	Number	 00000003h   
+@Model . . . . . . . . . . . . .	Number	 00000007h   
+@code  . . . . . . . . . . . . .	Text   	 _TEXT
+@data  . . . . . . . . . . . . .	Text   	 FLAT
+@fardata?  . . . . . . . . . . .	Text   	 FLAT
+@fardata . . . . . . . . . . . .	Text   	 FLAT
+@stack . . . . . . . . . . . . .	Text   	 FLAT
+ALT_MASK . . . . . . . . . . . .	Number	 00000003h   
+CAPSLOCK_ON  . . . . . . . . . .	Number	 00000080h   
+CODE_SIZE  . . . . . . . . . . .	Number	 00000008h   
+CREATE_ALWAYS  . . . . . . . . .	Number	 00000002h   
+CREATE_NEW . . . . . . . . . . .	Number	 00000001h   
+CTRL_MASK  . . . . . . . . . . .	Number	 0000000Ch   
+CreateFile . . . . . . . . . . .	Text   	 CreateFileA
+DISC_MIN_QTY . . . . . . . . . .	Number	 0000000Ah   
+DISC_PCT . . . . . . . . . . . .	Number	 0000000Ah   
+DO_NOT_SHARE . . . . . . . . . .	Number	 00000000h   
+ENABLE_ECHO_INPUT  . . . . . . .	Number	 00000004h   
+ENABLE_LINE_INPUT  . . . . . . .	Number	 00000002h   
+ENABLE_MOUSE_INPUT . . . . . . .	Number	 00000010h   
+ENABLE_PROCESSED_INPUT . . . . .	Number	 00000001h   
+ENABLE_PROCESSED_OUTPUT  . . . .	Number	 00000001h   
+ENABLE_WINDOW_INPUT  . . . . . .	Number	 00000008h   
+ENABLE_WRAP_AT_EOL_OUTPUT  . . .	Number	 00000002h   
+ENHANCED_KEY . . . . . . . . . .	Number	 00000100h   
+FALSE  . . . . . . . . . . . . .	Number	 00000000h   
+FILE_APPEND_DATA . . . . . . . .	Number	 00000004h   
+FILE_ATTRIBUTE_ARCHIVE . . . . .	Number	 00000020h   
+FILE_ATTRIBUTE_COMPRESSED  . . .	Number	 00000800h   
+FILE_ATTRIBUTE_DEVICE  . . . . .	Number	 00000040h   
+FILE_ATTRIBUTE_DIRECTORY . . . .	Number	 00000010h   
+FILE_ATTRIBUTE_ENCRYPTED . . . .	Number	 00004000h   
+FILE_ATTRIBUTE_HIDDEN  . . . . .	Number	 00000002h   
+FILE_ATTRIBUTE_NORMAL  . . . . .	Number	 00000080h   
+FILE_ATTRIBUTE_NOT_CONTENT_INDEXED .	Number	 00002000h   
+FILE_ATTRIBUTE_OFFLINE . . . . .	Number	 00001000h   
+FILE_ATTRIBUTE_READONLY  . . . .	Number	 00000001h   
+FILE_ATTRIBUTE_REPARSE_POINT . .	Number	 00000400h   
+FILE_ATTRIBUTE_SPARSE_FILE . . .	Number	 00000200h   
+FILE_ATTRIBUTE_SYSTEM  . . . . .	Number	 00000004h   
+FILE_ATTRIBUTE_TEMPORARY . . . .	Number	 00000100h   
+FILE_BEGIN . . . . . . . . . . .	Number	 00000000h   
+FILE_CAP . . . . . . . . . . . .	Number	 000001C1h   
+FILE_CURRENT . . . . . . . . . .	Number	 00000001h   
+FILE_DELETE_CHILD  . . . . . . .	Number	 00000040h   
+FILE_END . . . . . . . . . . . .	Number	 00000002h   
+FILE_MAX . . . . . . . . . . . .	Number	 000001C0h   
+FILE_READ_DATA . . . . . . . . .	Number	 00000001h   
+FILE_SHARE_DELETE  . . . . . . .	Number	 00000004h   
+FILE_SHARE_READ  . . . . . . . .	Number	 00000001h   
+FILE_SHARE_WRITE . . . . . . . .	Number	 00000002h   
+FILE_WRITE_DATA  . . . . . . . .	Number	 00000002h   
+FOCUS_EVENT  . . . . . . . . . .	Number	 00000010h   
+FORMAT_MESSAGE_ALLOCATE_BUFFER .	Number	 00000100h   
+FORMAT_MESSAGE_FROM_SYSTEM . . .	Number	 00001000h   
+FormatMessage  . . . . . . . . .	Text   	 FormatMessageA
+GENERIC_ALL  . . . . . . . . . .	Number	 10000000h   
+GENERIC_EXECUTE  . . . . . . . .	Number	 20000000h   
+GENERIC_READ . . . . . . . . . .	Number	 -80000000h   
+GENERIC_WRITE  . . . . . . . . .	Number	 40000000h   
+GetCommandLine . . . . . . . . .	Text   	 GetCommandLineA
+HANDLE . . . . . . . . . . . . .	Text   	 DWORD
+HDR_SIZE . . . . . . . . . . . .	Number	 00000008h   
+HEAP_GENERATE_EXCEPTIONS . . . .	Number	 00000004h   
+HEAP_GROWABLE  . . . . . . . . .	Number	 00000002h   
+HEAP_NO_SERIALIZE  . . . . . . .	Number	 00000001h   
+HEAP_REALLOC_IN_PLACE_ONLY . . .	Number	 00000010h   
+HEAP_ZERO_MEMORY . . . . . . . .	Number	 00000008h   
+IDABORT  . . . . . . . . . . . .	Number	 00000003h   
+IDCANCEL . . . . . . . . . . . .	Number	 00000002h   
+IDCLOSE  . . . . . . . . . . . .	Number	 00000008h   
+IDCONTINUE . . . . . . . . . . .	Number	 0000000Bh   
+IDHELP . . . . . . . . . . . . .	Number	 00000009h   
+IDIGNORE . . . . . . . . . . . .	Number	 00000005h   
+IDNO . . . . . . . . . . . . . .	Number	 00000007h   
+IDOK . . . . . . . . . . . . . .	Number	 00000001h   
+IDRETRY  . . . . . . . . . . . .	Number	 00000004h   
+IDTIMEOUT  . . . . . . . . . . .	Number	 00007D00h   
+IDTRYAGAIN . . . . . . . . . . .	Number	 0000000Ah   
+IDYES  . . . . . . . . . . . . .	Number	 00000006h   
+INBUF_MAX  . . . . . . . . . . .	Number	 0000003Fh   
+INVALID_HANDLE_VALUE . . . . . .	Number	 -00000001h   
+KBDOWN_FLAG  . . . . . . . . . .	Number	 00000001h   
+KEY_EVENT  . . . . . . . . . . .	Number	 00000001h   
+KEY_MASKS  . . . . . . . . . . .	Number	 0000001Fh   
+LEFT_ALT_PRESSED . . . . . . . .	Number	 00000002h   
+LEFT_CTRL_PRESSED  . . . . . . .	Number	 00000008h   
+MAGIC_INV1 . . . . . . . . . . .	Number	 31564E49h   
+MAX_PRICE  . . . . . . . . . . .	Number	 000F423Fh   
+MAX_STOCK  . . . . . . . . . . .	Number	 00000064h   
+MB_ABORTRETRYIGNORE  . . . . . .	Number	 00000002h   
+MB_APPLMODAL . . . . . . . . . .	Number	 00000000h   
+MB_CANCELTRYCONTINUE . . . . . .	Number	 00000006h   
+MB_DEFBUTTON1  . . . . . . . . .	Number	 00000000h   
+MB_DEFBUTTON2  . . . . . . . . .	Number	 00000100h   
+MB_DEFBUTTON3  . . . . . . . . .	Number	 00000200h   
+MB_DEFBUTTON4  . . . . . . . . .	Number	 00000300h   
+MB_HELP  . . . . . . . . . . . .	Number	 00004000h   
+MB_ICONASTERISK  . . . . . . . .	Number	 00000040h   
+MB_ICONERROR . . . . . . . . . .	Number	 00000010h   
+MB_ICONEXCLAMATION . . . . . . .	Number	 00000030h   
+MB_ICONHAND  . . . . . . . . . .	Number	 00000010h   
+MB_ICONINFORMATION . . . . . . .	Number	 00000040h   
+MB_ICONQUESTION  . . . . . . . .	Number	 00000020h   
+MB_ICONSTOP  . . . . . . . . . .	Number	 00000010h   
+MB_ICONWARNING . . . . . . . . .	Number	 00000030h   
+MB_OKCANCEL  . . . . . . . . . .	Number	 00000001h   
+MB_OK  . . . . . . . . . . . . .	Number	 00000000h   
+MB_RETRYCANCEL . . . . . . . . .	Number	 00000005h   
+MB_SYSTEMMODAL . . . . . . . . .	Number	 00001000h   
+MB_TASKMODAL . . . . . . . . . .	Number	 00002000h   
+MB_USERICON  . . . . . . . . . .	Number	 00000080h   
+MB_YESNOCANCEL . . . . . . . . .	Number	 00000003h   
+MB_YESNO . . . . . . . . . . . .	Number	 00000004h   
+MENU_EVENT . . . . . . . . . . .	Number	 00000008h   
+MOUSE_EVENT  . . . . . . . . . .	Number	 00000002h   
+MessageBox . . . . . . . . . . .	Text   	 MessageBoxA
+NAME_SIZE  . . . . . . . . . . .	Number	 0000001Ah   
+NULL . . . . . . . . . . . . . .	Number	 00000000h   
+NUMLOCK_ON . . . . . . . . . . .	Number	 00000020h   
+OFF_CODE . . . . . . . . . . . .	Number	 00000000h   
+OFF_NAME . . . . . . . . . . . .	Number	 00000008h   
+OFF_PRICE  . . . . . . . . . . .	Number	 00000024h   
+OFF_STOCK  . . . . . . . . . . .	Number	 00000028h   
+OPEN_ALWAYS  . . . . . . . . . .	Number	 00000004h   
+OPEN_EXISTING  . . . . . . . . .	Number	 00000003h   
+PROD_MAX . . . . . . . . . . . .	Number	 0000000Ah   
+PeekConsoleInput . . . . . . . .	Text   	 PeekConsoleInputA
+REC_SIZE . . . . . . . . . . . .	Number	 0000002Ch   
+RIGHT_ALT_PRESSED  . . . . . . .	Number	 00000001h   
+RIGHT_CTRL_PRESSED . . . . . . .	Number	 00000004h   
+ReadConsoleInput . . . . . . . .	Text   	 ReadConsoleInputA
+ReadConsole  . . . . . . . . . .	Text   	 ReadConsoleA
+SCROLLLOCK_ON  . . . . . . . . .	Number	 00000040h   
+SHIFT_MASK . . . . . . . . . . .	Number	 00000010h   
+SHIFT_PRESSED  . . . . . . . . .	Number	 00000010h   
+STD_ERROR_HANDLE . . . . . . . .	Number	 -0000000Ch   
+STD_INPUT_HANDLE . . . . . . . .	Number	 -0000000Ah   
+STD_OUTPUT_HANDLE  . . . . . . .	Number	 -0000000Bh   
+SetConsoleTitle  . . . . . . . .	Text   	 SetConsoleTitleA
+TAB  . . . . . . . . . . . . . .	Number	 00000009h   
+TRUE . . . . . . . . . . . . . .	Number	 00000001h   
+TRUNCATE_EXISTING  . . . . . . .	Number	 00000005h   
+VK_11  . . . . . . . . . . . . .	Number	 000000BDh   
+VK_12  . . . . . . . . . . . . .	Number	 000000BBh   
+VK_ADD . . . . . . . . . . . . .	Number	 0000006Bh   
+VK_BACK  . . . . . . . . . . . .	Number	 00000008h   
+VK_CANCEL  . . . . . . . . . . .	Number	 00000003h   
+VK_CAPITAL . . . . . . . . . . .	Number	 00000014h   
+VK_CLEAR . . . . . . . . . . . .	Number	 0000000Ch   
+VK_CONTROL . . . . . . . . . . .	Number	 00000011h   
+VK_DECIMAL . . . . . . . . . . .	Number	 0000006Eh   
+VK_DELETE  . . . . . . . . . . .	Number	 0000002Eh   
+VK_DIVIDE  . . . . . . . . . . .	Number	 0000006Fh   
+VK_DOWN  . . . . . . . . . . . .	Number	 00000028h   
+VK_END . . . . . . . . . . . . .	Number	 00000023h   
+VK_ESCAPE  . . . . . . . . . . .	Number	 0000001Bh   
+VK_EXECUTE . . . . . . . . . . .	Number	 0000002Bh   
+VK_F10 . . . . . . . . . . . . .	Number	 00000079h   
+VK_F11 . . . . . . . . . . . . .	Number	 0000007Ah   
+VK_F12 . . . . . . . . . . . . .	Number	 0000007Bh   
+VK_F13 . . . . . . . . . . . . .	Number	 0000007Ch   
+VK_F14 . . . . . . . . . . . . .	Number	 0000007Dh   
+VK_F15 . . . . . . . . . . . . .	Number	 0000007Eh   
+VK_F16 . . . . . . . . . . . . .	Number	 0000007Fh   
+VK_F17 . . . . . . . . . . . . .	Number	 00000080h   
+VK_F18 . . . . . . . . . . . . .	Number	 00000081h   
+VK_F19 . . . . . . . . . . . . .	Number	 00000082h   
+VK_F1  . . . . . . . . . . . . .	Number	 00000070h   
+VK_F20 . . . . . . . . . . . . .	Number	 00000083h   
+VK_F21 . . . . . . . . . . . . .	Number	 00000084h   
+VK_F22 . . . . . . . . . . . . .	Number	 00000085h   
+VK_F23 . . . . . . . . . . . . .	Number	 00000086h   
+VK_F24 . . . . . . . . . . . . .	Number	 00000087h   
+VK_F2  . . . . . . . . . . . . .	Number	 00000071h   
+VK_F3  . . . . . . . . . . . . .	Number	 00000072h   
+VK_F4  . . . . . . . . . . . . .	Number	 00000073h   
+VK_F5  . . . . . . . . . . . . .	Number	 00000074h   
+VK_F6  . . . . . . . . . . . . .	Number	 00000075h   
+VK_F7  . . . . . . . . . . . . .	Number	 00000076h   
+VK_F8  . . . . . . . . . . . . .	Number	 00000077h   
+VK_F9  . . . . . . . . . . . . .	Number	 00000078h   
+VK_HELP  . . . . . . . . . . . .	Number	 0000002Fh   
+VK_HOME  . . . . . . . . . . . .	Number	 00000024h   
+VK_INSERT  . . . . . . . . . . .	Number	 0000002Dh   
+VK_LBUTTON . . . . . . . . . . .	Number	 00000001h   
+VK_LCONTROL  . . . . . . . . . .	Number	 000000A2h   
+VK_LEFT  . . . . . . . . . . . .	Number	 00000025h   
+VK_LMENU . . . . . . . . . . . .	Number	 000000A4h   
+VK_LSHIFT  . . . . . . . . . . .	Number	 000000A0h   
+VK_MENU  . . . . . . . . . . . .	Number	 00000012h   
+VK_MULTIPLY  . . . . . . . . . .	Number	 0000006Ah   
+VK_NEXT  . . . . . . . . . . . .	Number	 00000022h   
+VK_NUMLOCK . . . . . . . . . . .	Number	 00000090h   
+VK_NUMPAD0 . . . . . . . . . . .	Number	 00000060h   
+VK_NUMPAD1 . . . . . . . . . . .	Number	 00000061h   
+VK_NUMPAD2 . . . . . . . . . . .	Number	 00000062h   
+VK_NUMPAD3 . . . . . . . . . . .	Number	 00000063h   
+VK_NUMPAD4 . . . . . . . . . . .	Number	 00000064h   
+VK_NUMPAD5 . . . . . . . . . . .	Number	 00000065h   
+VK_NUMPAD6 . . . . . . . . . . .	Number	 00000066h   
+VK_NUMPAD7 . . . . . . . . . . .	Number	 00000067h   
+VK_NUMPAD8 . . . . . . . . . . .	Number	 00000068h   
+VK_NUMPAD9 . . . . . . . . . . .	Number	 00000069h   
+VK_PAUSE . . . . . . . . . . . .	Number	 00000013h   
+VK_PRINT . . . . . . . . . . . .	Number	 0000002Ah   
+VK_PRIOR . . . . . . . . . . . .	Number	 00000021h   
+VK_RBUTTON . . . . . . . . . . .	Number	 00000002h   
+VK_RCONTROL  . . . . . . . . . .	Number	 000000A3h   
+VK_RETURN  . . . . . . . . . . .	Number	 0000000Dh   
+VK_RIGHT . . . . . . . . . . . .	Number	 00000027h   
+VK_RMENU . . . . . . . . . . . .	Number	 000000A5h   
+VK_RSHIFT  . . . . . . . . . . .	Number	 000000A1h   
+VK_SCROLL  . . . . . . . . . . .	Number	 00000091h   
+VK_SEPARATER . . . . . . . . . .	Number	 0000006Ch   
+VK_SHIFT . . . . . . . . . . . .	Number	 00000010h   
+VK_SNAPSHOT  . . . . . . . . . .	Number	 0000002Ch   
+VK_SPACE . . . . . . . . . . . .	Number	 00000020h   
+VK_SUBTRACT  . . . . . . . . . .	Number	 0000006Dh   
+VK_TAB . . . . . . . . . . . . .	Number	 00000009h   
+VK_UP  . . . . . . . . . . . . .	Number	 00000026h   
+WINDOW_BUFFER_SIZE_EVENT . . . .	Number	 00000004h   
+WriteConsoleOutputCharacter  . .	Text   	 WriteConsoleOutputCharacterA
+WriteConsole . . . . . . . . . .	Text   	 WriteConsoleA
+black  . . . . . . . . . . . . .	Number	 00000000h   
+blue . . . . . . . . . . . . . .	Number	 00000001h   
+brown  . . . . . . . . . . . . .	Number	 00000006h   
+bytesRead  . . . . . . . . . . .	DWord	 00000296 _DATA	
+cyan . . . . . . . . . . . . . .	Number	 00000003h   
+dirty  . . . . . . . . . . . . .	Byte	 000001C4 _DATA	
+exit . . . . . . . . . . . . . .	Text   	 INVOKE ExitProcess,0
+expected . . . . . . . . . . . .	DWord	 00000292 _DATA	
+fileHdr  . . . . . . . . . . . .	Byte	 00000000 _DATA	
+fileName . . . . . . . . . . . .	Byte	 0000027F _DATA	
+gray . . . . . . . . . . . . . .	Number	 00000008h   
+green  . . . . . . . . . . . . .	Number	 00000002h   
+hFile  . . . . . . . . . . . . .	DWord	 0000028E _DATA	
+inbuf  . . . . . . . . . . . . .	Byte	 000001C9 _DATA	
+junkbuf  . . . . . . . . . . . .	Byte	 00000209 _DATA	
+lightBlue  . . . . . . . . . . .	Number	 00000009h   
+lightCyan  . . . . . . . . . . .	Number	 0000000Bh   
+lightGray  . . . . . . . . . . .	Number	 00000007h   
+lightGreen . . . . . . . . . . .	Number	 0000000Ah   
+lightMagenta . . . . . . . . . .	Number	 0000000Dh   
+lightRed . . . . . . . . . . . .	Number	 0000000Ch   
+loadbuf  . . . . . . . . . . . .	Byte	 0000029A _DATA	
+magenta  . . . . . . . . . . . .	Number	 00000005h   
+mainEsp  . . . . . . . . . . . .	DWord	 000001C5 _DATA	
+msgAskCode . . . . . . . . . . .	Byte	 00000597 _DATA	
+msgAskName . . . . . . . . . . .	Byte	 000005AA _DATA	
+msgAskPrice  . . . . . . . . . .	Byte	 000005C7 _DATA	
+msgAskQty  . . . . . . . . . . .	Byte	 00000603 _DATA	
+msgAskStock  . . . . . . . . . .	Byte	 000005E4 _DATA	
+msgBadCode . . . . . . . . . . .	Byte	 00000618 _DATA	
+msgBadInput  . . . . . . . . . .	Byte	 0000055F _DATA	
+msgBadName . . . . . . . . . . .	Byte	 00000695 _DATA	
+msgBadOpt  . . . . . . . . . . .	Byte	 0000054C _DATA	
+msgBadPrice  . . . . . . . . . .	Byte	 000006BD _DATA	
+msgBadQty  . . . . . . . . . . .	Byte	 00000730 _DATA	
+msgBadStock  . . . . . . . . . .	Byte	 00000704 _DATA	
+msgBanner  . . . . . . . . . . .	Byte	 0000045C _DATA	
+msgBase  . . . . . . . . . . . .	Byte	 00000880 _DATA	
+msgDisc  . . . . . . . . . . . .	Byte	 00000890 _DATA	
+msgDollar  . . . . . . . . . . .	Byte	 00000AED _DATA	
+msgDot . . . . . . . . . . . . .	Byte	 00000AEF _DATA	
+msgDup . . . . . . . . . . . . .	Byte	 00000652 _DATA	
+msgEmpty . . . . . . . . . . . .	Byte	 000007A8 _DATA	
+msgExcess  . . . . . . . . . . .	Byte	 000007BC _DATA	
+msgExist . . . . . . . . . . . .	Byte	 00000ADD _DATA	
+msgFinal . . . . . . . . . . . .	Byte	 000008E1 _DATA	
+msgFull  . . . . . . . . . . . .	Byte	 0000075A _DATA	
+msgInvalid . . . . . . . . . . .	Byte	 00000A1A _DATA	
+msgLoaded  . . . . . . . . . . .	Byte	 00000A5F _DATA	
+msgMXN . . . . . . . . . . . . .	Byte	 00000AF3 _DATA	
+msgMenu  . . . . . . . . . . . .	Byte	 00000488 _DATA	
+msgNoDisc  . . . . . . . . . . .	Byte	 000008B9 _DATA	
+msgNoFile  . . . . . . . . . . .	Byte	 00000991 _DATA	
+msgNoStock . . . . . . . . . . .	Byte	 00000821 _DATA	
+msgNotFound  . . . . . . . . . .	Byte	 0000067B _DATA	
+msgOvf . . . . . . . . . . . . .	Byte	 0000084F _DATA	
+msgReadErr . . . . . . . . . . .	Byte	 000009DE _DATA	
+msgRecvOk  . . . . . . . . . . .	Byte	 000007F9 _DATA	
+msgRegOk . . . . . . . . . . . .	Byte	 00000791 _DATA	
+msgSaleOk  . . . . . . . . . . .	Byte	 000008F1 _DATA	
+msgSaveErr . . . . . . . . . . .	Byte	 00000972 _DATA	
+msgSaved . . . . . . . . . . . .	Byte	 0000094B _DATA	
+msgSep . . . . . . . . . . . . .	Byte	 00000AD9 _DATA	
+msgStackErr  . . . . . . . . . .	Byte	 00000ABC _DATA	
+msgSumRev  . . . . . . . . . . .	Byte	 00000933 _DATA	
+msgSumUnits  . . . . . . . . . .	Byte	 00000903 _DATA	
+msgSumValue  . . . . . . . . . .	Byte	 0000091B _DATA	
+msgUnsaved . . . . . . . . . . .	Byte	 00000A81 _DATA	
+msgZero  . . . . . . . . . . . .	Byte	 00000AF1 _DATA	
+numbuf . . . . . . . . . . . . .	Byte	 00000273 _DATA	
+prodCount  . . . . . . . . . . .	DWord	 00000004 _DATA	
+products . . . . . . . . . . . .	Byte	 00000008 _DATA	
+red  . . . . . . . . . . . . . .	Number	 00000004h   
+revenue  . . . . . . . . . . . .	DWord	 000001C0 _DATA	
+tmpCode  . . . . . . . . . . . .	Byte	 00000249 _DATA	
+tmpName  . . . . . . . . . . . .	Byte	 00000251 _DATA	
+tmpPrice . . . . . . . . . . . .	DWord	 0000026B _DATA	
+tmpStock . . . . . . . . . . . .	DWord	 0000026F _DATA	
+white  . . . . . . . . . . . . .	Number	 0000000Fh   
+wsprintf . . . . . . . . . . . .	Text   	 wsprintfA
+yellow . . . . . . . . . . . . .	Number	 0000000Eh   
+
+	   0 Warnings
+	   0 Errors
